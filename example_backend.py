@@ -5,8 +5,9 @@ from pathlib import Path
 from collections import deque
 import os
 import pickle
+import time
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import numpy as np
 
@@ -32,6 +33,7 @@ CORS(app, resources={
 })
 
 MODEL_PATH = Path(os.getenv('MODEL_PATH', './model/xgboost_model.pkl'))
+INGEST_TTL_SECONDS = float(os.getenv('INGEST_TTL_SECONDS', '6'))
 
 FEATURE_ORDER = [
     'ecc_count',
@@ -57,7 +59,11 @@ _shap_explainer = None
 _model_feature_order = list(FEATURE_ORDER)
 _unmapped_model_features = []
 _last_feature_mapping = []
+_last_derived_features = {}
+_last_model_input_vector = []
 _latest_telemetry = None
+_latest_telemetry_source = 'simulation'
+_latest_ingest_epoch = None
 _latest_prediction = {
     'health_score': 72,
     'failure_probability': 0.15,
@@ -116,6 +122,8 @@ def _get_numeric_value(payload, keys, default_value=0.0):
                 return float(payload[key])
             except Exception:
                 continue
+    if default_value is None:
+        return None
     return float(default_value)
 
 
@@ -257,14 +265,47 @@ def _generate_telemetry():
     }
 
 
+def _is_ingested_telemetry_fresh():
+    if _latest_telemetry_source != 'simulink' or _latest_ingest_epoch is None:
+        return False
+    return (time.time() - _latest_ingest_epoch) <= INGEST_TTL_SECONDS
+
+
+def _normalize_telemetry_payload(payload):
+    normalized = {}
+    for key, value in payload.items():
+        if isinstance(value, (int, float, np.number)):
+            normalized[key] = float(value)
+        else:
+            normalized[key] = value
+
+    for base_key in FEATURE_ORDER:
+        if base_key in normalized:
+            continue
+        fallback_value = _get_numeric_value(normalized, FEATURE_ALIASES.get(base_key, []), default_value=None)
+        if fallback_value is not None:
+            normalized[base_key] = float(fallback_value)
+
+    if 'timestamp' not in normalized:
+        normalized['timestamp'] = datetime.utcnow().isoformat() + 'Z'
+
+    return normalized
+
+
 def _extract_feature_vector(telemetry):
-    global _unmapped_model_features, _last_feature_mapping
+    global _unmapped_model_features, _last_feature_mapping, _last_derived_features, _last_model_input_vector
 
     feature_payload = _build_derived_feature_payload(telemetry)
+    _last_derived_features = {
+        key: float(value)
+        for key, value in feature_payload.items()
+        if isinstance(value, (int, float, np.number))
+    }
 
     values = []
     unmapped = []
     mapping_rows = []
+    input_vector_rows = []
     for feature_name in _model_feature_order:
         value, missing_feature, source_key = _value_for_model_feature(feature_name, feature_payload)
         values.append(value)
@@ -276,9 +317,14 @@ def _extract_feature_vector(telemetry):
             'defaulted': source_key is None,
             'value': float(value),
         })
+        input_vector_rows.append({
+            'feature': feature_name,
+            'value': float(value),
+        })
 
     _unmapped_model_features = unmapped
     _last_feature_mapping = mapping_rows
+    _last_model_input_vector = input_vector_rows
     return np.array([values], dtype=float)
 
 
@@ -369,10 +415,36 @@ def _shap_from_telemetry(telemetry):
 
 @app.route('/api/telemetry', methods=['GET'])
 def get_telemetry():
-    global _latest_telemetry
+    global _latest_telemetry, _latest_telemetry_source
+
+    if _latest_telemetry is not None and _is_ingested_telemetry_fresh():
+        return jsonify(_latest_telemetry)
+
     telemetry = _generate_telemetry()
     _latest_telemetry = telemetry
+    _latest_telemetry_source = 'simulation'
     return jsonify(telemetry)
+
+
+@app.route('/api/ingest-telemetry', methods=['POST'])
+def ingest_telemetry():
+    global _latest_telemetry, _latest_telemetry_source, _latest_ingest_epoch
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'Expected JSON object payload'}), 400
+
+    normalized = _normalize_telemetry_payload(payload)
+    _latest_telemetry = normalized
+    _latest_telemetry_source = 'simulink'
+    _latest_ingest_epoch = time.time()
+
+    return jsonify({
+        'status': 'ok',
+        'source': _latest_telemetry_source,
+        'timestamp': normalized.get('timestamp'),
+        'received_fields': sorted(list(normalized.keys())),
+    }), 200
 
 
 # ============================================================================
@@ -449,11 +521,18 @@ def health_check():
     telemetry = _latest_telemetry or _generate_telemetry()
     _extract_feature_vector(telemetry)
 
+    telemetry_age_ms = None
+    if _latest_ingest_epoch is not None:
+        telemetry_age_ms = int((time.time() - _latest_ingest_epoch) * 1000)
+
     return jsonify({
         'status': 'ok',
         'timestamp': datetime.utcnow().isoformat(),
         'model_loaded': model is not None,
         'model_path': str(MODEL_PATH),
+        'telemetry_source': _latest_telemetry_source,
+        'telemetry_age_ms': telemetry_age_ms,
+        'ingest_ttl_seconds': INGEST_TTL_SECONDS,
         'model_features': _model_feature_order,
         'unmapped_features': _unmapped_model_features,
         'feature_mapping': _last_feature_mapping,
@@ -478,6 +557,24 @@ def feature_mapping():
     }), 200
 
 
+@app.route('/api/feature-vector', methods=['GET'])
+def feature_vector():
+    model = _load_model()
+    telemetry = _latest_telemetry or _generate_telemetry()
+    _extract_feature_vector(telemetry)
+
+    return jsonify({
+        'model_loaded': model is not None,
+        'model_path': str(MODEL_PATH),
+        'feature_count': len(_last_model_input_vector),
+        'unmapped_count': len(_unmapped_model_features),
+        'unmapped_features': _unmapped_model_features,
+        'telemetry': telemetry,
+        'derived_features': _last_derived_features,
+        'model_input_vector': _last_model_input_vector,
+    }), 200
+
+
 # ============================================================================
 # ROOT ENDPOINT
 # ============================================================================
@@ -490,10 +587,13 @@ def root():
         'model_path': str(MODEL_PATH),
         'endpoints': [
             '/api/telemetry - Real-time SSD telemetry data',
+            '/api/ingest-telemetry - Receive telemetry from Simulink',
             '/api/prediction - ML model predictions',
             '/api/shap - SHAP explainability',
             '/api/alerts - Alert system',
             '/api/health - Health check',
+            '/api/feature-mapping - Model feature alignment',
+            '/api/feature-vector - Current derived model input',
         ],
     })
 
@@ -531,10 +631,12 @@ if __name__ == '__main__':
     print('')
     print('Available endpoints:')
     print('  GET /api/telemetry  - Real-time SSD telemetry')
+    print('  POST /api/ingest-telemetry - Receive telemetry from Simulink')
     print('  GET /api/prediction - ML model predictions')
     print('  GET /api/shap       - Feature importance')
     print('  GET /api/alerts     - Alert system')
     print('  GET /api/feature-mapping - Model feature alignment')
+    print('  GET /api/feature-vector  - Current derived model input')
     print('  GET /api/health     - Health check')
     print('')
     print('Frontend: http://localhost:5173')
