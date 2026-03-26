@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { getAlerts, getPrediction, getShapExplanation, getTelemetry, healthCheck } from '../services/api'
 
 const DRIVE_IDS = ['SSD-A1', 'SSD-B2', 'SSD-C3', 'SSD-D4']
 
@@ -256,7 +257,7 @@ function CenterPanel({ blocks, logs }) {
   )
 }
 
-function RightPanel({ predictionDays, confidence, eccLine, wearLine }) {
+function RightPanel({ predictionDays, confidence, eccLine, wearLine, shapFactors }) {
   return (
     <aside className="space-y-3 border-l border-[#16233d] bg-[#060b17] p-3">
       <div className="rounded-md border border-[#1a2a42] bg-[#0b1221] p-3">
@@ -281,11 +282,7 @@ function RightPanel({ predictionDays, confidence, eccLine, wearLine }) {
 
         <div className="mt-4 space-y-2 text-sm text-[#7f97bc]">
           <p className="text-[0.65rem] uppercase tracking-[0.22em] text-[#4a6388]">SHAP — Top Factors</p>
-          {[
-            ['ECC acceleration', 30],
-            ['Wear level', 29],
-            ['Temperature avg', 24],
-          ].map(([label, value]) => (
+          {shapFactors.map(([label, value]) => (
             <div key={label}>
               <div className="flex justify-between text-xs">
                 <span>{label}</span>
@@ -340,6 +337,12 @@ export default function ReferenceDashboard() {
   const [alerts, setAlerts] = useState(1)
   const [predictionDays, setPredictionDays] = useState(309.8)
   const [confidence, setConfidence] = useState(77)
+  const [shapFactors, setShapFactors] = useState([
+    ['ECC acceleration', 30],
+    ['Wear level', 29],
+    ['Temperature avg', 24],
+  ])
+  const [apiConnected, setApiConnected] = useState(false)
   const [eccLine, setEccLine] = useState(() => Array.from({ length: 30 }, (_, i) => 20 + i * 1.2 + Math.random() * 8))
   const [wearLine, setWearLine] = useState(() => Array.from({ length: 30 }, (_, i) => 8 + i * 0.9 + Math.random() * 2))
 
@@ -349,16 +352,20 @@ export default function ReferenceDashboard() {
     const metricTimer = setInterval(() => {
       setDrives((prev) => prev.map((drive, idx) => ({
         ...drive,
-        wear: Math.max(1, drive.wear + (Math.random() - 0.45) * 0.8),
-        temp: Math.max(25, drive.temp + (Math.random() - 0.48) * 0.8),
-        ecc: Math.max(0.5, drive.ecc + (Math.random() - 0.45) * 1.2),
+        wear: apiConnected ? drive.wear : Math.max(1, drive.wear + (Math.random() - 0.45) * 0.8),
+        temp: apiConnected ? drive.temp : Math.max(25, drive.temp + (Math.random() - 0.48) * 0.8),
+        ecc: apiConnected ? drive.ecc : Math.max(0.5, drive.ecc + (Math.random() - 0.45) * 1.2),
         active: idx === Math.floor(Math.random() * prev.length),
       })))
 
-      setPredictionDays((prev) => Math.max(70, prev + (Math.random() - 0.5) * 2.8))
-      setConfidence((prev) => Math.min(95, Math.max(62, prev + (Math.random() - 0.5) * 2)))
+      if (!apiConnected) {
+        setPredictionDays((prev) => Math.max(70, prev + (Math.random() - 0.5) * 2.8))
+        setConfidence((prev) => Math.min(95, Math.max(62, prev + (Math.random() - 0.5) * 2)))
+      }
       setEvents((prev) => prev + (Math.random() > 0.62 ? 1 : 0))
-      setAlerts((prev) => (Math.random() > 0.9 ? Math.min(prev + 1, 4) : Math.max(prev - 1, 1)))
+      if (!apiConnected) {
+        setAlerts((prev) => (Math.random() > 0.9 ? Math.min(prev + 1, 4) : Math.max(prev - 1, 1)))
+      }
 
       setEccLine((prev) => [...prev.slice(1), prev[prev.length - 1] + (Math.random() - 0.3) * 4])
       setWearLine((prev) => [...prev.slice(1), prev[prev.length - 1] + Math.random() * 0.9])
@@ -382,11 +389,66 @@ export default function ReferenceDashboard() {
       })
     }, 2500)
 
+    const pullApiData = async () => {
+      try {
+        const ok = await healthCheck()
+        setApiConnected(ok)
+        if (!ok) {
+          return
+        }
+
+        const [telemetry, prediction, shap, alert] = await Promise.all([
+          getTelemetry(false),
+          getPrediction(false),
+          getShapExplanation(false),
+          getAlerts(false),
+        ])
+
+        setPredictionDays(Number(prediction.remaining_life_days) || 0)
+        setConfidence(Math.round((1 - Number(prediction.failure_probability || 0)) * 100))
+
+        const mappedShap = (Array.isArray(shap) ? shap : [])
+          .slice(0, 3)
+          .map((item) => [item.feature, Math.round(Number(item.impact || 0) * 100)])
+        if (mappedShap.length > 0) {
+          setShapFactors(mappedShap)
+        }
+
+        const levelMap = {
+          INFO: 1,
+          WARNING: 2,
+          CRITICAL: 3,
+          FATAL: 4,
+        }
+        setAlerts(levelMap[alert.level] || 1)
+
+        setDrives((prev) => prev.map((drive, index) => {
+          if (index !== 0) {
+            return drive
+          }
+
+          return {
+            ...drive,
+            wear: Number(telemetry.wear_level) || drive.wear,
+            temp: Number(telemetry.temperature) || drive.temp,
+            ecc: Number(telemetry.ecc_rate) || drive.ecc,
+            active: true,
+          }
+        }))
+      } catch (error) {
+        setApiConnected(false)
+      }
+    }
+
+    pullApiData()
+    const apiTimer = setInterval(pullApiData, 5000)
+
     return () => {
       clearInterval(clockTimer)
       clearInterval(metricTimer)
+      clearInterval(apiTimer)
     }
-  }, [])
+  }, [apiConnected])
 
   return (
     <div className="min-h-screen bg-[#030814] text-gray-100">
@@ -396,6 +458,9 @@ export default function ReferenceDashboard() {
           <span className="rounded border border-[#1a2a42] bg-[#071022] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[#7f97bc]">SSD Simulation</span>
           <span className="rounded border border-[#1a2a42] bg-[#071022] px-3 py-1 font-mono text-sm text-[#9bc7ff]">{time.toLocaleTimeString('en-GB')}</span>
           <span className="flex items-center gap-2 text-sm text-green-400"><span className="h-2 w-2 rounded-full bg-green-400" />LIVE</span>
+          <span className={`rounded border px-2 py-1 text-xs ${apiConnected ? 'border-green-700 bg-green-900/30 text-green-400' : 'border-yellow-700 bg-yellow-900/20 text-yellow-400'}`}>
+            {apiConnected ? 'MODEL API' : 'SIMULATION'}
+          </span>
         </div>
         <div className="flex items-center gap-4 text-sm text-[#7f97bc]">
           <span>Drives: <b className="text-white">4</b></span>
@@ -408,7 +473,7 @@ export default function ReferenceDashboard() {
       <div className="grid min-h-[calc(100vh-72px)] grid-cols-1 xl:grid-cols-[220px_1fr_270px]">
         <LeftPanel drives={drives} />
         <CenterPanel blocks={blocks} logs={logs} />
-        <RightPanel predictionDays={predictionDays} confidence={confidence} eccLine={eccLine} wearLine={wearLine} />
+        <RightPanel predictionDays={predictionDays} confidence={confidence} eccLine={eccLine} wearLine={wearLine} shapFactors={shapFactors} />
       </div>
     </div>
   )

@@ -25,7 +25,13 @@ npm run dev
 
 1. **Run example backend** (or use Dockerfile example in BACKEND_INTEGRATION.md)
    ```bash
-   pip install flask flask-cors numpy
+   pip install flask flask-cors numpy xgboost joblib shap
+   # Place your trained model at: ./model/xgboost_model.pkl
+   # (or set MODEL_PATH to a custom location)
+   # Windows PowerShell
+   $env:MODEL_PATH="C:/path/to/your/xgboost_model.pkl"
+   # macOS/Linux
+   # export MODEL_PATH="/path/to/your/xgboost_model.pkl"
    python example_backend.py
    ```
 

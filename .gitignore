@@ -30,3 +30,6 @@ yarn-error.log*
 # Misc
 .cache/
 *.pem
+
+# Local ML model artifacts
+model/*.pkl

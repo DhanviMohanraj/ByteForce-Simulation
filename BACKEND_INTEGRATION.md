@@ -6,6 +6,8 @@ This document is for **ML engineers** and **backend developers** integrating the
 
 ## Quick Integration Checklist
 
+- [ ] Place your trained model `.pkl` file in an accessible path
+- [ ] Set `MODEL_PATH` environment variable to that file path
 - [ ] Implement `/api/telemetry` endpoint
 - [ ] Implement `/api/prediction` endpoint
 - [ ] Implement `/api/shap` endpoint
@@ -14,6 +16,25 @@ This document is for **ML engineers** and **backend developers** integrating the
 - [ ] Test with the frontend
 - [ ] Document response formats
 - [ ] Set up error handling
+
+### XGBoost `.pkl` Quick Start
+
+```bash
+pip install flask flask-cors numpy xgboost joblib shap
+
+# Default repo location (recommended):
+# ./model/xgboost_model.pkl
+
+# Windows PowerShell
+$env:MODEL_PATH="C:/path/to/your/xgboost_model.pkl"
+
+# macOS/Linux
+# export MODEL_PATH="/path/to/your/xgboost_model.pkl"
+
+python example_backend.py
+```
+
+The example backend now auto-detects model feature names (`feature_names_in_` / XGBoost booster names) and maps telemetry fields by aliases to reduce schema mismatch risk.
 
 ---
 
