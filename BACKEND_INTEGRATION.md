@@ -6,8 +6,8 @@ This document is for **ML engineers** and **backend developers** integrating the
 
 ## Quick Integration Checklist
 
-- [ ] Place your trained model `.pkl` file in an accessible path
-- [ ] Set `MODEL_PATH` environment variable to that file path
+- [ ] Place your trained artifacts in `./model/` (`xgboost.pkl`, `lstm.h5`, `features.json`)
+- [ ] Set `MODEL_PATH`, `LSTM_MODEL_PATH`, and `FEATURES_PATH` as needed
 - [ ] Implement `/api/telemetry` endpoint
 - [ ] Implement `/api/prediction` endpoint
 - [ ] Implement `/api/shap` endpoint
@@ -20,16 +20,22 @@ This document is for **ML engineers** and **backend developers** integrating the
 ### XGBoost `.pkl` Quick Start
 
 ```bash
-pip install flask flask-cors numpy xgboost joblib shap
+pip install flask flask-cors numpy xgboost joblib shap tensorflow
 
-# Default repo location (recommended):
-# ./model/xgboost_model.pkl
+# Default repo locations (recommended):
+# ./model/xgboost.pkl
+# ./model/lstm.h5
+# ./model/features.json
 
 # Windows PowerShell
-$env:MODEL_PATH="C:/path/to/your/xgboost_model.pkl"
+$env:MODEL_PATH="C:/path/to/your/xgboost.pkl"
+$env:LSTM_MODEL_PATH="C:/path/to/your/lstm.h5"
+$env:FEATURES_PATH="C:/path/to/your/features.json"
 
 # macOS/Linux
-# export MODEL_PATH="/path/to/your/xgboost_model.pkl"
+# export MODEL_PATH="/path/to/your/xgboost.pkl"
+# export LSTM_MODEL_PATH="/path/to/your/lstm.h5"
+# export FEATURES_PATH="/path/to/your/features.json"
 
 python example_backend.py
 ```

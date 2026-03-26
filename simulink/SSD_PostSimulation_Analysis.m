@@ -190,3 +190,113 @@ fprintf('  SSD Analysis Dashboard generated successfully.\n');
 fprintf('  9 plots covering all system components.\n');
 fprintf('  Dashed lines = sample data. Run simulation for real data.\n');
 fprintf('=================================================================\n');
+
+%% -------------------------------------------------------------------------
+%  ML DATASET EXPORT (telemetry + derived SMART-style features)
+% -------------------------------------------------------------------------
+
+[t_base, hasRealSim] = getTimeBaseFromWorkspace();
+
+ecc_count   = getSignalAtTime('ws_ecc_count',   t_base, max(0, 30 + 0.4 * (t_base .^ 1.1)));
+ecc_rate    = getSignalAtTime('ws_ecc_rate',    t_base, min(1, 0.03 + 0.002 * t_base));
+retries     = getSignalAtTime('ws_retries',     t_base, max(0, 2 + 0.12 * t_base));
+temperature = getSignalAtTime('ws_temperature', t_base, 32 + 0.07 * t_base);
+wear_level  = getSignalAtTime('ws_wear_level',  t_base, min(100, t_base));
+latency     = getSignalAtTime('ws_latency',     t_base, 0.5 + 0.01 * t_base);
+
+ecc_count = max(ecc_count, 0);
+ecc_rate = min(max(ecc_rate, 0), 1);
+retries = max(retries, 0);
+temperature = min(max(temperature, 20), 95);
+wear_level = min(max(wear_level, 0), 100);
+latency = max(latency, 0.05);
+
+smart_5_raw = ecc_count;
+smart_187_raw = retries;
+smart_197_raw = ecc_rate * 1000;
+smart_198_raw = latency * 100;
+
+window = 20;
+telemetryTable = table(...
+    t_base, ecc_count, ecc_rate, retries, temperature, wear_level, latency, ...
+    smart_5_raw, smart_187_raw, smart_197_raw, smart_198_raw, ...
+    movmean(smart_5_raw, window), [0; diff(smart_5_raw)], [0; diff([0; diff(smart_5_raw)])], movstd(smart_5_raw, window), ...
+    movmean(smart_187_raw, window), [0; diff(smart_187_raw)], [0; diff([0; diff(smart_187_raw)])], movstd(smart_187_raw, window), ...
+    movmean(smart_197_raw, window), [0; diff(smart_197_raw)], [0; diff([0; diff(smart_197_raw)])], movstd(smart_197_raw, window), ...
+    movmean(smart_198_raw, window), [0; diff(smart_198_raw)], [0; diff([0; diff(smart_198_raw)])], movstd(smart_198_raw, window), ...
+    'VariableNames', {
+    'time_s','ecc_count','ecc_rate','retries','temperature','wear_level','latency', ...
+    'smart_5_raw','smart_187_raw','smart_197_raw','smart_198_raw', ...
+    'smart_5_raw_roll_mean','smart_5_raw_diff','smart_5_raw_acc','smart_5_raw_roll_std', ...
+    'smart_187_raw_roll_mean','smart_187_raw_diff','smart_187_raw_acc','smart_187_raw_roll_std', ...
+    'smart_197_raw_roll_mean','smart_197_raw_diff','smart_197_raw_acc','smart_197_raw_roll_std', ...
+    'smart_198_raw_roll_mean','smart_198_raw_diff','smart_198_raw_acc','smart_198_raw_roll_std'});
+
+scriptDir = fileparts(mfilename('fullpath'));
+telemetryCsvPath = fullfile(scriptDir, 'ssd_ml_telemetry.csv');
+telemetryJsonPath = fullfile(scriptDir, 'ssd_ml_telemetry.json');
+
+writetable(telemetryTable, telemetryCsvPath);
+
+jsonStruct = table2struct(telemetryTable);
+fid = fopen(telemetryJsonPath, 'w');
+if fid ~= -1
+    fwrite(fid, jsonencode(jsonStruct), 'char');
+    fclose(fid);
+end
+
+if hasRealSim
+    fprintf('  ML telemetry exported from real simulation data.\n');
+else
+    fprintf('  ML telemetry exported from fallback synthetic profile (simulation logs missing).\n');
+end
+fprintf('  CSV:  %s\n', telemetryCsvPath);
+fprintf('  JSON: %s\n', telemetryJsonPath);
+
+
+function [t, hasRealSim] = getTimeBaseFromWorkspace()
+hasRealSim = false;
+t = linspace(0, 100, 1001)';
+candidateSignals = {'ws_ecc_rate','ws_rber','ws_score','ws_pe'};
+
+for i = 1:numel(candidateSignals)
+    name = candidateSignals{i};
+    if evalin('base', sprintf('exist(''%s'',''var'')', name))
+        s = evalin('base', name);
+        if isstruct(s) && isfield(s, 'time')
+            tCandidate = s.time(:);
+            if isnumeric(tCandidate) && numel(tCandidate) > 5
+                t = tCandidate;
+                hasRealSim = true;
+                return;
+            end
+        end
+    end
+end
+end
+
+
+function values = getSignalAtTime(varName, tBase, fallback)
+values = fallback;
+if ~evalin('base', sprintf('exist(''%s'',''var'')', varName))
+    return;
+end
+
+s = evalin('base', varName);
+if ~isstruct(s) || ~isfield(s, 'time') || ~isfield(s, 'signals') || ~isfield(s.signals, 'values')
+    return;
+end
+
+t = s.time(:);
+v = s.signals.values;
+if size(v,2) > 1
+    v = v(:,1);
+end
+v = double(v(:));
+
+if numel(t) < 2 || numel(v) ~= numel(t)
+    return;
+end
+
+values = interp1(t, v, tBase, 'linear', 'extrap');
+end

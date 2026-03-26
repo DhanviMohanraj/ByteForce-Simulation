@@ -33,3 +33,4 @@ yarn-error.log*
 
 # Local ML model artifacts
 model/*.pkl
+model/*.h5

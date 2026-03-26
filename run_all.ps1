@@ -2,11 +2,25 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonExe = 'c:/Users/dhanv/OneDrive/Desktop/ByteForce-Simulation/.venv/Scripts/python.exe'
-$modelPath = Join-Path $projectRoot 'model/xgboost_model.pkl'
+$xgbModelPath = Join-Path $projectRoot 'model/xgboost.pkl'
+if (-not (Test-Path $xgbModelPath)) {
+    $altXgbPath = Join-Path $projectRoot 'model/xgboost_model.pkl'
+    if (Test-Path $altXgbPath) {
+        $xgbModelPath = $altXgbPath
+    }
+}
+$lstmModelPath = Join-Path $projectRoot 'model/lstm.h5'
+if (-not (Test-Path $lstmModelPath)) {
+    $altLstmPath = Join-Path $projectRoot 'model/lstm_model.h5'
+    if (Test-Path $altLstmPath) {
+        $lstmModelPath = $altLstmPath
+    }
+}
+$featuresPath = Join-Path $projectRoot 'model/features.json'
 
 Write-Host 'Starting ByteForce full system...' -ForegroundColor Cyan
 
-$backendCmd = "Set-Location '$projectRoot'; `$env:MODEL_PATH='$modelPath'; `$env:INGEST_TTL_SECONDS='30'; & '$pythonExe' example_backend.py"
+$backendCmd = "Set-Location '$projectRoot'; `$env:MODEL_PATH='$xgbModelPath'; `$env:LSTM_MODEL_PATH='$lstmModelPath'; `$env:FEATURES_PATH='$featuresPath'; `$env:INGEST_TTL_SECONDS='30'; & '$pythonExe' example_backend.py"
 $frontendCmd = "Set-Location '$projectRoot'; npm run dev -- --host 0.0.0.0 --port 5173"
 
 # Clear conflicting listeners

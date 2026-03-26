@@ -21,7 +21,72 @@
 % =========================================================================
 
 clc; clear; close all;
-addpath(fileparts(mfilename('fullpath')));
+
+scriptFullPath = mfilename('fullpath');
+if isempty(scriptFullPath)
+    scriptFullPath = which('SSD_Simulation');
+end
+
+scriptDir = '';
+if ~isempty(scriptFullPath)
+    scriptDir = fileparts(scriptFullPath);
+end
+
+candidateDirs = {};
+if ~isempty(scriptDir), candidateDirs{end+1} = scriptDir; end %#ok<AGROW>
+candidateDirs{end+1} = pwd;
+candidateDirs{end+1} = fullfile(pwd, 'simulink');
+if ~isempty(scriptDir)
+    candidateDirs{end+1} = fileparts(scriptDir);
+    candidateDirs{end+1} = fullfile(fileparts(scriptDir), 'simulink');
+end
+
+for i = 1:numel(candidateDirs)
+    if isfolder(candidateDirs{i})
+        addpath(candidateDirs{i});
+    end
+end
+rehash;
+
+requiredBridgeFiles = {
+    'simulinkPublishStep.m',
+    'mapHardwareSignalsToByteForce.m',
+    'sendTelemetryToByteForce.m'
+};
+
+simulinkDir = '';
+for i = 1:numel(candidateDirs)
+    d = candidateDirs{i};
+    if ~isfolder(d)
+        continue;
+    end
+    hasAll = true;
+    for j = 1:numel(requiredBridgeFiles)
+        if ~isfile(fullfile(d, requiredBridgeFiles{j}))
+            hasAll = false;
+            break;
+        end
+    end
+    if hasAll
+        simulinkDir = d;
+        break;
+    end
+end
+
+if isempty(simulinkDir)
+    error('Missing required bridge files. Run this script from the simulink folder or ensure simulink/ is present on MATLAB path.');
+end
+
+for i = 1:numel(requiredBridgeFiles)
+    if ~isfile(fullfile(simulinkDir, requiredBridgeFiles{i}))
+        error('Missing required bridge file: %s', requiredBridgeFiles{i});
+    end
+end
+
+if exist('simulinkPublishStep', 'file') ~= 2
+    error('Bridge function simulinkPublishStep.m is not on MATLAB path. Current bridge dir: %s', simulinkDir);
+end
+
 fprintf('=================================================================\n');
 fprintf('  SSD PROFESSIONAL SIMULATION — Starting Build\n');
 fprintf('=================================================================\n\n');
@@ -77,6 +142,9 @@ set_param(mdl, ...
     'SaveOutput',          'on', ...
     'SignalLogging',       'on', ...
     'SignalLoggingName',   'logsout');
+
+simulinkDirEsc = strrep(simulinkDir, '''', '''''');
+set_param(mdl, 'InitFcn', sprintf("if exist(''simulinkPublishStep'',''file'')~=2, addpath(''%s''); rehash; end", simulinkDirEsc));
 
 % Canvas background colour (dark theme feel via annotations)
 fprintf('  [1/9] Setting up model canvas...\n');
@@ -587,16 +655,14 @@ add_line(mdl,'BBM/2',       'Retire/4');
 % =========================================================================
 fprintf('  [8.5/9] Wiring ByteForce software bridge...\n');
 
-% Top-level publisher block calling simulinkPublishStep(...)
-add_block('simulink/User-Defined Functions/MATLAB Function', [mdl '/Publish_To_ByteForce'], ...
-    'Position', [1000, 270, 1260, 430]);
+% Top-level publisher block (version-safe): Mux 6 signals into MATLAB Fcn
+add_block('simulink/Signal Routing/Mux', [mdl '/Bridge_Publish_Mux'], ...
+    'Position', [920, 300, 960, 450], ...
+    'Inputs', '6');
 
-publishCode = [ ...
-"function status = fcn(distortionEvents, packetErrorRate, retryCount, junctionTempC, stressPercent, processingLatencyMs)", newline, ...
-"status = simulinkPublishStep(distortionEvents, packetErrorRate, retryCount, junctionTempC, stressPercent, processingLatencyMs);", newline, ...
-"end" ...
-];
-set_param([mdl '/Publish_To_ByteForce'], 'Script', publishCode);
+add_block('simulink/User-Defined Functions/MATLAB Fcn', [mdl '/Publish_To_ByteForce'], ...
+    'Position', [1000, 300, 1260, 380], ...
+    'MATLABFcn', 'simulinkPublishStep(u(1),u(2),u(3),u(4),u(5),u(6))');
 
 add_block('simulink/Sinks/Display', [mdl '/Bridge_Status'], ...
     'Position', [1280, 330, 1400, 370], ...
@@ -608,62 +674,188 @@ add_block('built-in/Note', [mdl '/Lbl_Bridge_Status'], ...
     'FontSize', '9', ...
     'FontWeight', 'bold');
 
-% packetErrorRate = clamp(rber, 0..1)
-add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_RBER_Clamp'], ...
-    'Position', [1000, 180, 1080, 220], ...
+% -------------------------------------------------------------------------
+% Realistic SSD telemetry synthesis for ML inputs
+%   ecc_count    ~ cumulative distortion from bit-errors, wear, and burst noise
+%   ecc_rate     ~ packet/error rate driven by RBER + retry pressure
+%   retries      ~ read-retry demand from decoder iterations and retry flags
+%   temperature  ~ thermal rise from wear + error activity + queue pressure
+%   wear_level   ~ normalized P/E cycle usage
+%   latency      ~ latency inflation from decoder complexity and retries
+% -------------------------------------------------------------------------
+
+% retries = clamp(3*retry_flag + 0.35*iter_used + burst_jitter, 0..250)
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_RetryFlag_to_Num'], ...
+    'Position', [980, 130, 1070, 170], ...
+    'Gain', '3');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Iter_to_Retry'], ...
+    'Position', [980, 180, 1070, 220], ...
+    'Gain', '0.35');
+add_block('simulink/Sources/Random Number', [mdl '/Bridge_Retry_Jitter'], ...
+    'Position', [980, 230, 1070, 270], ...
+    'Mean', '0', ...
+    'Variance', '4', ...
+    'SampleTime', '0.1');
+add_block('simulink/Math Operations/Abs', [mdl '/Bridge_Retry_JitterAbs'], ...
+    'Position', [1090, 230, 1135, 270]);
+add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Retry_Sum'], ...
+    'Position', [1160, 155, 1220, 235], ...
+    'Inputs', '+++');
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Retry_Clamp'], ...
+    'Position', [1240, 175, 1320, 215], ...
+    'UpperLimit', '250', ...
+    'LowerLimit', '0');
+
+% packetErrorRate = clamp(4*rber + 0.0015*retries, 0..1)
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_RBER_to_Packet'], ...
+    'Position', [980, 290, 1070, 330], ...
+    'Gain', '4');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Retry_to_Packet'], ...
+    'Position', [1090, 290, 1185, 330], ...
+    'Gain', '0.0015');
+add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Packet_Sum'], ...
+    'Position', [1205, 290, 1260, 330], ...
+    'Inputs', '++');
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Packet_Clamp'], ...
+    'Position', [1280, 290, 1360, 330], ...
     'UpperLimit', '1', ...
     'LowerLimit', '0');
 
-% junctionTempC ~= 35 + 0.005 * pe_count
-add_block('simulink/Math Operations/Gain', [mdl '/Bridge_PE_to_Temp'], ...
-    'Position', [1000, 470, 1080, 510], ...
-    'Gain', '0.005');
-add_block('simulink/Sources/Constant', [mdl '/Bridge_Temp_Base'], ...
-    'Position', [1000, 520, 1080, 550], ...
-    'Value', '35');
-add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Temp_Sum'], ...
-    'Position', [1110, 480, 1160, 540], ...
-    'Inputs', '++');
+% ecc_count (distortionEvents) = clamp(0.25*bit_errors + 0.02*pe_count + 4*|noise|, 0..1e6)
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_BitErr_to_Dist'], ...
+    'Position', [980, 360, 1085, 400], ...
+    'Gain', '0.25');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_PE_to_Dist'], ...
+    'Position', [980, 410, 1085, 450], ...
+    'Gain', '0.02');
+add_block('simulink/Sources/Random Number', [mdl '/Bridge_Dist_Noise'], ...
+    'Position', [980, 460, 1085, 500], ...
+    'Mean', '0', ...
+    'Variance', '1', ...
+    'SampleTime', '0.1');
+add_block('simulink/Math Operations/Abs', [mdl '/Bridge_Dist_NoiseAbs'], ...
+    'Position', [1105, 460, 1150, 500]);
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Dist_NoiseGain'], ...
+    'Position', [1170, 460, 1260, 500], ...
+    'Gain', '4');
+add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Distortion_Sum'], ...
+    'Position', [1170, 390, 1240, 450], ...
+    'Inputs', '+++');
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Distortion_Clamp'], ...
+    'Position', [1265, 400, 1360, 440], ...
+    'UpperLimit', '1e6', ...
+    'LowerLimit', '0');
 
-% stressPercent ~= clamp(100 * retired_blocks / total_blocks, 0..100)
-add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Retired_to_Stress'], ...
-    'Position', [1000, 580, 1100, 620], ...
-    'Gain', num2str(100 / p.num_blocks));
-add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Stress_Clamp'], ...
-    'Position', [1130, 580, 1210, 620], ...
+% junctionTempC = clamp(30 + 0.004*pe_count + 18*ecc_rate + 0.01*retries, 20..95)
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_PE_to_Temp'], ...
+    'Position', [980, 550, 1080, 590], ...
+    'Gain', '0.004');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Err_to_Temp'], ...
+    'Position', [980, 600, 1080, 640], ...
+    'Gain', '18');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Retry_to_Temp'], ...
+    'Position', [980, 650, 1080, 690], ...
+    'Gain', '0.01');
+add_block('simulink/Sources/Constant', [mdl '/Bridge_Temp_Base'], ...
+    'Position', [980, 700, 1080, 730], ...
+    'Value', '30');
+add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Temp_Sum'], ...
+    'Position', [1110, 585, 1180, 735], ...
+    'Inputs', '++++');
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Temp_Clamp'], ...
+    'Position', [1210, 635, 1290, 675], ...
+    'UpperLimit', '95', ...
+    'LowerLimit', '20');
+
+% wear_level = clamp(100 * pe_count / max_pe, 0..100)
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_PE_to_Wear'], ...
+    'Position', [980, 760, 1085, 800], ...
+    'Gain', num2str(100 / p.max_pe));
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Wear_Clamp'], ...
+    'Position', [1110, 760, 1190, 800], ...
     'UpperLimit', '100', ...
     'LowerLimit', '0');
 
-% processingLatencyMs ~= 0.5 + 0.05 * iter_used
+% processingLatencyMs = clamp(0.35 + 0.025*iter + 0.01*retries + 4*ecc_rate, 0.1..20)
 add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Iter_to_Lat'], ...
-    'Position', [1000, 650, 1080, 690], ...
-    'Gain', '0.05');
+    'Position', [980, 840, 1080, 880], ...
+    'Gain', '0.025');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Retry_to_Lat'], ...
+    'Position', [980, 890, 1080, 930], ...
+    'Gain', '0.01');
+add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Err_to_Lat'], ...
+    'Position', [980, 940, 1080, 980], ...
+    'Gain', '4');
 add_block('simulink/Sources/Constant', [mdl '/Bridge_Lat_Base'], ...
-    'Position', [1000, 700, 1080, 730], ...
-    'Value', '0.5');
+    'Position', [980, 990, 1080, 1020], ...
+    'Value', '0.35');
 add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Lat_Sum'], ...
-    'Position', [1110, 660, 1160, 720], ...
-    'Inputs', '++');
+    'Position', [1110, 875, 1180, 1025], ...
+    'Inputs', '++++');
+add_block('simulink/Discontinuities/Saturation', [mdl '/Bridge_Lat_Clamp'], ...
+    'Position', [1210, 935, 1290, 975], ...
+    'UpperLimit', '20', ...
+    'LowerLimit', '0.1');
 
 % Bridge wiring from existing model signals
-add_line(mdl, 'NAND_Model/3', 'Publish_To_ByteForce/1', 'autorouting', 'on');
-add_line(mdl, 'NAND_Model/1', 'Bridge_RBER_Clamp/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_RBER_Clamp/1', 'Publish_To_ByteForce/2', 'autorouting', 'on');
-add_line(mdl, 'Health_Mon/4', 'Publish_To_ByteForce/3', 'autorouting', 'on');
+% retries path
+add_line(mdl, 'LDPC_Dec/5', 'Bridge_RetryFlag_to_Num/1', 'autorouting', 'on');
+add_line(mdl, 'LDPC_Dec/2', 'Bridge_Iter_to_Retry/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Jitter/1', 'Bridge_Retry_JitterAbs/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_RetryFlag_to_Num/1', 'Bridge_Retry_Sum/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Iter_to_Retry/1', 'Bridge_Retry_Sum/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_JitterAbs/1', 'Bridge_Retry_Sum/3', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Sum/1', 'Bridge_Retry_Clamp/1', 'autorouting', 'on');
 
+% packet error rate path
+add_line(mdl, 'NAND_Model/1', 'Bridge_RBER_to_Packet/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Clamp/1', 'Bridge_Retry_to_Packet/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_RBER_to_Packet/1', 'Bridge_Packet_Sum/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_to_Packet/1', 'Bridge_Packet_Sum/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Packet_Sum/1', 'Bridge_Packet_Clamp/1', 'autorouting', 'on');
+
+% distortion / ecc count path
+add_line(mdl, 'NAND_Model/3', 'Bridge_BitErr_to_Dist/1', 'autorouting', 'on');
+add_line(mdl, 'NAND_Model/2', 'Bridge_PE_to_Dist/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Dist_Noise/1', 'Bridge_Dist_NoiseAbs/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Dist_NoiseAbs/1', 'Bridge_Dist_NoiseGain/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_BitErr_to_Dist/1', 'Bridge_Distortion_Sum/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_PE_to_Dist/1', 'Bridge_Distortion_Sum/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Dist_NoiseGain/1', 'Bridge_Distortion_Sum/3', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Distortion_Sum/1', 'Bridge_Distortion_Clamp/1', 'autorouting', 'on');
+
+% temperature path
 add_line(mdl, 'NAND_Model/2', 'Bridge_PE_to_Temp/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Packet_Clamp/1', 'Bridge_Err_to_Temp/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Clamp/1', 'Bridge_Retry_to_Temp/1', 'autorouting', 'on');
 add_line(mdl, 'Bridge_PE_to_Temp/1', 'Bridge_Temp_Sum/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Temp_Base/1', 'Bridge_Temp_Sum/2', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Temp_Sum/1', 'Publish_To_ByteForce/4', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Err_to_Temp/1', 'Bridge_Temp_Sum/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_to_Temp/1', 'Bridge_Temp_Sum/3', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Temp_Base/1', 'Bridge_Temp_Sum/4', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Temp_Sum/1', 'Bridge_Temp_Clamp/1', 'autorouting', 'on');
 
-add_line(mdl, 'Retire/2', 'Bridge_Retired_to_Stress/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Retired_to_Stress/1', 'Bridge_Stress_Clamp/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Stress_Clamp/1', 'Publish_To_ByteForce/5', 'autorouting', 'on');
+% wear level path
+add_line(mdl, 'NAND_Model/2', 'Bridge_PE_to_Wear/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_PE_to_Wear/1', 'Bridge_Wear_Clamp/1', 'autorouting', 'on');
 
+% latency path
 add_line(mdl, 'LDPC_Dec/2', 'Bridge_Iter_to_Lat/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Clamp/1', 'Bridge_Retry_to_Lat/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Packet_Clamp/1', 'Bridge_Err_to_Lat/1', 'autorouting', 'on');
 add_line(mdl, 'Bridge_Iter_to_Lat/1', 'Bridge_Lat_Sum/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Lat_Base/1', 'Bridge_Lat_Sum/2', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Lat_Sum/1', 'Publish_To_ByteForce/6', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_to_Lat/1', 'Bridge_Lat_Sum/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Err_to_Lat/1', 'Bridge_Lat_Sum/3', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Lat_Base/1', 'Bridge_Lat_Sum/4', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Lat_Sum/1', 'Bridge_Lat_Clamp/1', 'autorouting', 'on');
+
+% Final bridge inputs expected by simulinkPublishStep(...)
+add_line(mdl, 'Bridge_Distortion_Clamp/1', 'Bridge_Publish_Mux/1', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Packet_Clamp/1', 'Bridge_Publish_Mux/2', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Retry_Clamp/1', 'Bridge_Publish_Mux/3', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Temp_Clamp/1', 'Bridge_Publish_Mux/4', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Wear_Clamp/1', 'Bridge_Publish_Mux/5', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Lat_Clamp/1', 'Bridge_Publish_Mux/6', 'autorouting', 'on');
+add_line(mdl, 'Bridge_Publish_Mux/1', 'Publish_To_ByteForce/1', 'autorouting', 'on');
 
 add_line(mdl, 'Publish_To_ByteForce/1', 'Bridge_Status/1', 'autorouting', 'on');
 
@@ -745,6 +937,12 @@ ws_signals = {
     'Retire/1',      'ws_ret_stage';
     'Retire/2',      'ws_retired';
     'Retire/4',      'ws_drv_health';
+    'Bridge_Distortion_Clamp/1', 'ws_ecc_count';
+    'Bridge_Packet_Clamp/1',     'ws_ecc_rate';
+    'Bridge_Retry_Clamp/1',      'ws_retries';
+    'Bridge_Temp_Clamp/1',       'ws_temperature';
+    'Bridge_Wear_Clamp/1',       'ws_wear_level';
+    'Bridge_Lat_Clamp/1',        'ws_latency';
 };
 
 ws_base_pos = [1100, 50];

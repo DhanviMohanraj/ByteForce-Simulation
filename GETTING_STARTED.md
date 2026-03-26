@@ -25,13 +25,20 @@ npm run dev
 
 1. **Run example backend** (or use Dockerfile example in BACKEND_INTEGRATION.md)
    ```bash
-   pip install flask flask-cors numpy xgboost joblib shap
-   # Place your trained model at: ./model/xgboost_model.pkl
-   # (or set MODEL_PATH to a custom location)
+   pip install flask flask-cors numpy xgboost joblib shap tensorflow
+   # Place your trained artifacts in ./model/
+   #   xgboost.pkl
+   #   lstm.h5
+   #   features.json
+   # (or set MODEL_PATH / LSTM_MODEL_PATH / FEATURES_PATH)
    # Windows PowerShell
-   $env:MODEL_PATH="C:/path/to/your/xgboost_model.pkl"
+   $env:MODEL_PATH="C:/path/to/your/xgboost.pkl"
+   $env:LSTM_MODEL_PATH="C:/path/to/your/lstm.h5"
+   $env:FEATURES_PATH="C:/path/to/your/features.json"
    # macOS/Linux
-   # export MODEL_PATH="/path/to/your/xgboost_model.pkl"
+   # export MODEL_PATH="/path/to/your/xgboost.pkl"
+   # export LSTM_MODEL_PATH="/path/to/your/lstm.h5"
+   # export FEATURES_PATH="/path/to/your/features.json"
    python example_backend.py
    ```
 

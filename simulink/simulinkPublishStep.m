@@ -1,7 +1,9 @@
 function statusCode = simulinkPublishStep(distortionEvents, packetErrorRate, retryCount, junctionTempC, stressPercent, processingLatencyMs)
-% Use this in a MATLAB Function block (simulation mode).
-coder.extrinsic('sendTelemetryToByteForce');
-coder.extrinsic('mapHardwareSignalsToByteForce');
+% Works for interpreted MATLAB Fcn block and MATLAB Function simulation mode.
+if ~isempty(coder.target)
+	coder.extrinsic('sendTelemetryToByteForce');
+	coder.extrinsic('mapHardwareSignalsToByteForce');
+end
 
 signals = struct();
 signals.distortion_events = distortionEvents;

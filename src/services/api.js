@@ -115,6 +115,20 @@ export const healthCheck = async () => {
 }
 
 /**
+ * Health details
+ * Returns backend health payload for connectivity/source diagnostics
+ */
+export const getHealthStatus = async () => {
+  try {
+    const response = await apiClient.get('/health')
+    return response.data
+  } catch (error) {
+    console.warn('Backend health details unavailable:', error.message)
+    return null
+  }
+}
+
+/**
  * Set API configuration
  * For connecting to different backend environments
  */
@@ -128,5 +142,6 @@ export default {
   getShapExplanation,
   getAlerts,
   healthCheck,
+  getHealthStatus,
   setApiUrl,
 }

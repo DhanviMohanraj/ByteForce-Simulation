@@ -3,6 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+import json
 import os
 import pickle
 import time
@@ -21,6 +22,11 @@ try:
 except ImportError:
     shap = None
 
+try:
+    from tensorflow.keras.models import load_model as keras_load_model
+except Exception:
+    keras_load_model = None
+
 app = Flask(__name__)
 
 # Enable CORS for frontend (adjust origins for production)
@@ -32,8 +38,36 @@ CORS(app, resources={
     }
 })
 
-MODEL_PATH = Path(os.getenv('MODEL_PATH', './model/xgboost_model.pkl'))
+
+def _resolve_artifact_path(primary_env, legacy_env, default_candidates):
+    raw_path = os.getenv(primary_env) or (os.getenv(legacy_env) if legacy_env else None)
+    if raw_path:
+        return Path(raw_path)
+
+    for candidate in default_candidates:
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return candidate_path
+
+    return Path(default_candidates[0])
+
+XGBOOST_MODEL_PATH = _resolve_artifact_path(
+    'MODEL_PATH',
+    'XGBOOST_MODEL_PATH',
+    ['./model/xgboost.pkl', './model/xgboost_model.pkl'],
+)
+LSTM_MODEL_PATH = _resolve_artifact_path(
+    'LSTM_MODEL_PATH',
+    None,
+    ['./model/lstm.h5', './model/lstm_model.h5'],
+)
+FEATURES_PATH = _resolve_artifact_path(
+    'FEATURES_PATH',
+    None,
+    ['./model/features.json'],
+)
 INGEST_TTL_SECONDS = float(os.getenv('INGEST_TTL_SECONDS', '6'))
+LSTM_WINDOW = int(os.getenv('LSTM_WINDOW', '20'))
 
 FEATURE_ORDER = [
     'ecc_count',
@@ -57,6 +91,10 @@ _model = None
 _model_load_error = None
 _shap_explainer = None
 _model_feature_order = list(FEATURE_ORDER)
+_lstm_model = None
+_lstm_model_load_error = None
+_features_file_load_error = None
+_features_from_file = []
 _unmapped_model_features = []
 _last_feature_mapping = []
 _last_derived_features = {}
@@ -69,6 +107,8 @@ _latest_prediction = {
     'failure_probability': 0.15,
     'remaining_life_days': 320,
 }
+
+_lstm_history = deque(maxlen=max(LSTM_WINDOW, 1))
 
 FEATURE_ALIASES = {
     'ecc_count': ['ecc_count', 'ecccount', 'ecc_total', 'ecc_errors', 'ecc_error_count'],
@@ -101,6 +141,9 @@ for canonical, aliases in FEATURE_ALIASES.items():
 
 
 def _resolve_model_feature_order(model):
+    if _features_from_file:
+        return list(_features_from_file)
+
     if hasattr(model, 'feature_names_in_') and getattr(model, 'feature_names_in_', None) is not None:
         return [str(name) for name in list(model.feature_names_in_)]
 
@@ -113,6 +156,42 @@ def _resolve_model_feature_order(model):
             pass
 
     return list(FEATURE_ORDER)
+
+
+def _load_feature_order_from_file():
+    global _features_from_file, _features_file_load_error
+
+    if _features_from_file:
+        return list(_features_from_file)
+
+    if not FEATURES_PATH.exists():
+        _features_file_load_error = f'Features file not found: {FEATURES_PATH.resolve()}'
+        return []
+
+    try:
+        with open(FEATURES_PATH, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+
+        feature_candidates = payload
+        if isinstance(payload, dict):
+            for key in ('features', 'feature_names', 'columns', 'input_features'):
+                if key in payload:
+                    feature_candidates = payload[key]
+                    break
+
+        if not isinstance(feature_candidates, list):
+            raise ValueError('Expected a list of feature names or a dict containing one')
+
+        parsed = [str(item).strip() for item in feature_candidates if str(item).strip()]
+        if not parsed:
+            raise ValueError('features.json has no valid feature names')
+
+        _features_from_file = parsed
+        _features_file_load_error = None
+        return list(_features_from_file)
+    except Exception as exc:
+        _features_file_load_error = str(exc)
+        return []
 
 
 def _get_numeric_value(payload, keys, default_value=0.0):
@@ -220,8 +299,10 @@ def _load_model():
     if _model is not None:
         return _model
 
-    if not MODEL_PATH.exists():
-        _model_load_error = f'Model file not found: {MODEL_PATH.resolve()}'
+    _load_feature_order_from_file()
+
+    if not XGBOOST_MODEL_PATH.exists():
+        _model_load_error = f'Model file not found: {XGBOOST_MODEL_PATH.resolve()}'
         return None
 
     loaders = []
@@ -232,7 +313,7 @@ def _load_model():
     errors = []
     for name, loader in loaders:
         try:
-            _model = loader(MODEL_PATH)
+            _model = loader(XGBOOST_MODEL_PATH)
             _model_load_error = None
             break
         except Exception as exc:
@@ -251,6 +332,76 @@ def _load_model():
     _model_feature_order = _resolve_model_feature_order(_model)
 
     return _model
+
+
+def _load_lstm_model():
+    global _lstm_model, _lstm_model_load_error
+
+    if _lstm_model is not None:
+        return _lstm_model
+
+    if not LSTM_MODEL_PATH.exists():
+        _lstm_model_load_error = f'LSTM model file not found: {LSTM_MODEL_PATH.resolve()}'
+        return None
+
+    if keras_load_model is None:
+        _lstm_model_load_error = 'TensorFlow/Keras not installed; install tensorflow to use lstm.h5'
+        return None
+
+    try:
+        _lstm_model = keras_load_model(LSTM_MODEL_PATH)
+        _lstm_model_load_error = None
+        return _lstm_model
+    except Exception as exc:
+        _lstm_model_load_error = str(exc)
+        return None
+
+
+def _predict_remaining_life_days_lstm():
+    lstm_model = _load_lstm_model()
+    if lstm_model is None or not _last_model_input_vector:
+        return None
+
+    current_vector = np.array([row['value'] for row in _last_model_input_vector], dtype=float)
+    _lstm_history.append(current_vector)
+
+    try:
+        input_shape = getattr(lstm_model, 'input_shape', None)
+        expected_timesteps = input_shape[1] if input_shape and len(input_shape) >= 3 else LSTM_WINDOW
+        expected_features = input_shape[2] if input_shape and len(input_shape) >= 3 else current_vector.shape[0]
+    except Exception:
+        expected_timesteps = LSTM_WINDOW
+        expected_features = current_vector.shape[0]
+
+    if expected_features is not None and int(expected_features) != int(current_vector.shape[0]):
+        return None
+
+    expected_timesteps = int(expected_timesteps) if expected_timesteps is not None else LSTM_WINDOW
+    expected_timesteps = max(expected_timesteps, 1)
+
+    sequence = list(_lstm_history)
+    if len(sequence) < expected_timesteps:
+        pad = [sequence[0] if sequence else current_vector] * (expected_timesteps - len(sequence))
+        sequence = pad + sequence
+    else:
+        sequence = sequence[-expected_timesteps:]
+
+    lstm_input = np.array([sequence], dtype=float)
+
+    try:
+        pred = float(np.ravel(lstm_model.predict(lstm_input, verbose=0))[0])
+    except TypeError:
+        pred = float(np.ravel(lstm_model.predict(lstm_input))[0])
+    except Exception:
+        return None
+
+    if not np.isfinite(pred):
+        return None
+
+    if 0.0 <= pred <= 1.0:
+        return int(round(pred * 365.0))
+
+    return int(round(max(0.0, pred)))
 
 
 def _generate_telemetry():
@@ -358,7 +509,9 @@ def _predict_from_telemetry(telemetry):
 
     probability = float(np.clip(probability, 0.0, 1.0))
     health_score = int(round((1.0 - probability) * 100))
-    remaining_life_days = int(round(max(0, health_score * 6.0)))
+    remaining_life_days = _predict_remaining_life_days_lstm()
+    if remaining_life_days is None:
+        remaining_life_days = int(round(max(0, health_score * 6.0)))
 
     return {
         'health_score': health_score,
@@ -529,14 +682,22 @@ def health_check():
         'status': 'ok',
         'timestamp': datetime.utcnow().isoformat(),
         'model_loaded': model is not None,
-        'model_path': str(MODEL_PATH),
+        'xgboost_model_loaded': model is not None,
+        'xgboost_model_path': str(XGBOOST_MODEL_PATH),
+        'lstm_model_loaded': _load_lstm_model() is not None,
+        'lstm_model_path': str(LSTM_MODEL_PATH),
+        'features_path': str(FEATURES_PATH),
+        'features_loaded': bool(_features_from_file),
+        'features_count': len(_model_feature_order),
         'telemetry_source': _latest_telemetry_source,
         'telemetry_age_ms': telemetry_age_ms,
         'ingest_ttl_seconds': INGEST_TTL_SECONDS,
         'model_features': _model_feature_order,
         'unmapped_features': _unmapped_model_features,
         'feature_mapping': _last_feature_mapping,
-        'model_error': _model_load_error,
+        'xgboost_model_error': _model_load_error,
+        'lstm_model_error': _lstm_model_load_error,
+        'features_file_error': _features_file_load_error,
         'shap_available': _shap_explainer is not None,
     }), 200
 
@@ -549,7 +710,7 @@ def feature_mapping():
 
     return jsonify({
         'model_loaded': model is not None,
-        'model_path': str(MODEL_PATH),
+        'model_path': str(XGBOOST_MODEL_PATH),
         'mapping_count': len(_last_feature_mapping),
         'unmapped_count': len(_unmapped_model_features),
         'unmapped_features': _unmapped_model_features,
@@ -565,7 +726,7 @@ def feature_vector():
 
     return jsonify({
         'model_loaded': model is not None,
-        'model_path': str(MODEL_PATH),
+        'model_path': str(XGBOOST_MODEL_PATH),
         'feature_count': len(_last_model_input_vector),
         'unmapped_count': len(_unmapped_model_features),
         'unmapped_features': _unmapped_model_features,
@@ -584,7 +745,9 @@ def root():
     return jsonify({
         'name': 'NAND Guardian Backend',
         'version': '0.2.0',
-        'model_path': str(MODEL_PATH),
+        'xgboost_model_path': str(XGBOOST_MODEL_PATH),
+        'lstm_model_path': str(LSTM_MODEL_PATH),
+        'features_path': str(FEATURES_PATH),
         'endpoints': [
             '/api/telemetry - Real-time SSD telemetry data',
             '/api/ingest-telemetry - Receive telemetry from Simulink',
@@ -623,11 +786,22 @@ if __name__ == '__main__':
     print('================================')
     print('')
     print('Starting server on http://localhost:8000')
-    print(f'MODEL_PATH: {MODEL_PATH.resolve()}')
+    print(f'XGBOOST_MODEL_PATH: {XGBOOST_MODEL_PATH.resolve()}')
+    print(f'LSTM_MODEL_PATH: {LSTM_MODEL_PATH.resolve()}')
+    print(f'FEATURES_PATH: {FEATURES_PATH.resolve()}')
     if _model_load_error:
-        print(f'Model load status: fallback mode ({_model_load_error})')
+        print(f'XGBoost load status: fallback mode ({_model_load_error})')
     else:
-        print('Model load status: loaded successfully')
+        print('XGBoost load status: loaded successfully')
+    _load_lstm_model()
+    if _lstm_model_load_error:
+        print(f'LSTM load status: optional fallback ({_lstm_model_load_error})')
+    else:
+        print('LSTM load status: loaded successfully')
+    if _features_file_load_error:
+        print(f'Features file status: fallback to detected model features ({_features_file_load_error})')
+    else:
+        print(f'Features file status: loaded {len(_model_feature_order)} features')
     print('')
     print('Available endpoints:')
     print('  GET /api/telemetry  - Real-time SSD telemetry')

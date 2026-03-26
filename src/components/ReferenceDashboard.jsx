@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { getAlerts, getPrediction, getShapExplanation, getTelemetry, healthCheck } from '../services/api'
+import { getAlerts, getHealthStatus, getPrediction, getShapExplanation, getTelemetry, healthCheck } from '../services/api'
 
 const DRIVE_IDS = ['SSD-A1', 'SSD-B2', 'SSD-C3', 'SSD-D4']
 
@@ -343,6 +343,7 @@ export default function ReferenceDashboard() {
     ['Temperature avg', 24],
   ])
   const [apiConnected, setApiConnected] = useState(false)
+  const [simulinkConnected, setSimulinkConnected] = useState(false)
   const [eccLine, setEccLine] = useState(() => Array.from({ length: 30 }, (_, i) => 20 + i * 1.2 + Math.random() * 8))
   const [wearLine, setWearLine] = useState(() => Array.from({ length: 30 }, (_, i) => 8 + i * 0.9 + Math.random() * 2))
 
@@ -391,9 +392,23 @@ export default function ReferenceDashboard() {
 
     const pullApiData = async () => {
       try {
-        const ok = await healthCheck()
+        const [ok, health] = await Promise.all([
+          healthCheck(),
+          getHealthStatus(),
+        ])
+
         setApiConnected(ok)
+
+        const ttlSeconds = Number(health?.ingest_ttl_seconds)
+        const telemetryAgeMs = Number(health?.telemetry_age_ms)
+        const telemetryFresh = Number.isFinite(ttlSeconds) && Number.isFinite(telemetryAgeMs)
+          ? telemetryAgeMs <= (ttlSeconds * 1000)
+          : false
+        const simLive = health?.telemetry_source === 'simulink' && telemetryFresh
+        setSimulinkConnected(Boolean(simLive))
+
         if (!ok) {
+          setSimulinkConnected(false)
           return
         }
 
@@ -437,6 +452,7 @@ export default function ReferenceDashboard() {
         }))
       } catch (error) {
         setApiConnected(false)
+        setSimulinkConnected(false)
       }
     }
 
@@ -460,6 +476,9 @@ export default function ReferenceDashboard() {
           <span className="flex items-center gap-2 text-sm text-green-400"><span className="h-2 w-2 rounded-full bg-green-400" />LIVE</span>
           <span className={`rounded border px-2 py-1 text-xs ${apiConnected ? 'border-green-700 bg-green-900/30 text-green-400' : 'border-yellow-700 bg-yellow-900/20 text-yellow-400'}`}>
             {apiConnected ? 'MODEL API' : 'SIMULATION'}
+          </span>
+          <span className={`rounded border px-2 py-1 text-xs ${simulinkConnected ? 'border-cyan-700 bg-cyan-900/30 text-cyan-300' : 'border-slate-700 bg-slate-900/30 text-slate-300'}`}>
+            {simulinkConnected ? 'LIVE SIMULINK CONNECTED' : 'SIMULINK FEED OFF'}
           </span>
         </div>
         <div className="flex items-center gap-4 text-sm text-[#7f97bc]">
