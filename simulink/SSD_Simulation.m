@@ -15,9 +15,9 @@
 %  HOW TO RUN:
 %    1. Place this file in a folder e.g. C:\SSD_Project\
 %    2. cd to that folder in MATLAB
-%    3. run('SSD_Professional_Simulation.m')
+%    3. run('SSD_Simulation.m')
 %    4. Press RUN in Simulink
-%    5. After sim: run SSD_Analysis
+%    5. After sim: run('SSD_Analysis.m')
 % =========================================================================
 
 clc; clear; close all;
@@ -70,6 +70,8 @@ set_param(mdl, ...
     'StopTime',            num2str(p.sim_time), ...
     'Solver',              'FixedStepDiscrete', ...
     'FixedStep',           '0.1', ...
+    'DataTypeOverride',    'Double', ...
+    'DataTypeOverrideAppliesTo', 'AllNumericTypes', ...
     'SimulationMode',      'normal', ...
     'SaveTime',            'on', ...
     'SaveOutput',          'on', ...
@@ -815,7 +817,7 @@ fprintf('  NEXT STEPS:\n');
 fprintf('  1. Simulink model is now open\n');
 fprintf('  2. Press the green RUN button (Stop Time = 100)\n');
 fprintf('  3. Double-click any scope to watch live signals\n');
-fprintf('  4. After sim completes, run: SSD_Analysis\n');
+fprintf('  4. After sim completes, run: SSD_Analysis.m\n');
 fprintf('  5. Start software dashboard at: http://localhost:5173\n');
 fprintf('  6. Bridge target endpoint: http://localhost:8000/api/ingest-telemetry\n');
 fprintf('\n');

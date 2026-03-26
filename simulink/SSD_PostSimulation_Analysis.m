@@ -1,4 +1,4 @@
-% SSD_Analysis.m
+% SSD_PostSimulation_Analysis.m
 % Run after simulation completes to generate full analysis dashboard
 % All plots work with or without simulation data
 
