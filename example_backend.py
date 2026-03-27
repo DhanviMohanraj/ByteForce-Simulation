@@ -8,7 +8,7 @@ import os
 import pickle
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 import numpy as np
 
@@ -109,6 +109,17 @@ _latest_prediction = {
 }
 
 _lstm_history = deque(maxlen=max(LSTM_WINDOW, 1))
+_event_log = deque(maxlen=20)
+
+EVENT_CODE_MAP = {
+    0: {'tag': 'NOMINAL', 'message': 'System operating normally'},
+    1: {'tag': 'JOURNAL', 'message': 'Journal fill >75% — compaction pending'},
+    2: {'tag': 'BBM',     'message': 'New bad block isolated and remapped'},
+    3: {'tag': 'RETRY',   'message': 'Read retry engaged — tracking voltage shift'},
+    4: {'tag': 'WEAR',    'message': 'LDPC Stage 4 engaged — deep recovery mode'},
+    5: {'tag': 'UBER',    'message': 'Uncorrectable ECC read error (UBER)'},
+    6: {'tag': 'JOURNAL', 'message': 'Journal capacity critical — flush triggered'},
+}
 
 FEATURE_ALIASES = {
     'ecc_count': ['ecc_count', 'ecccount', 'ecc_total', 'ecc_errors', 'ecc_error_count'],
@@ -412,6 +423,11 @@ def _generate_telemetry():
         'temperature': int(np.random.randint(35, 55)),
         'wear_level': float(np.random.uniform(5, 50)),
         'latency': float(np.random.uniform(0.5, 3.0)),
+        'bad_block_count': int(np.random.randint(10, 50)),
+        'journal_fill_pct': float(np.random.uniform(10, 80)),
+        'uber_count': 0,
+        'retirement_stage': 0,
+        'event_code': 0,
         'timestamp': datetime.utcnow().isoformat() + 'Z',
     }
 
@@ -592,12 +608,37 @@ def ingest_telemetry():
     _latest_telemetry_source = 'simulink'
     _latest_ingest_epoch = time.time()
 
+    # Process event code
+    event_code = int(normalized.get('event_code', 0))
+    if event_code > 0 and event_code in EVENT_CODE_MAP:
+        # Avoid spamming the same event code if nothing else changed
+        if not _event_log or _event_log[0]['code'] != event_code:
+            entry = EVENT_CODE_MAP[event_code]
+            _event_log.appendleft({
+                'id': f"{int(time.time() * 1000)}-{event_code}",
+                'time': datetime.utcnow().strftime('%H:%M:%S'),
+                'code': event_code,
+                'tag': entry['tag'],
+                'message': entry['message'],
+                'isLive': True,
+            })
+
     return jsonify({
         'status': 'ok',
         'source': _latest_telemetry_source,
         'timestamp': normalized.get('timestamp'),
         'received_fields': sorted(list(normalized.keys())),
     }), 200
+
+# ============================================================================
+# EVENTS ENDPOINT
+# ============================================================================
+
+@app.route('/api/events', methods=['GET'])
+def get_events():
+    """Returns the last 20 firmware events from the simulation."""
+    return jsonify(list(_event_log))
+
 
 
 # ============================================================================
@@ -737,6 +778,111 @@ def feature_vector():
 
 
 # ============================================================================
+# SIMULATION STATUS ENDPOINT
+# ============================================================================
+
+@app.route('/api/simulation-status', methods=['GET'])
+def simulation_status():
+    """Lightweight endpoint: is real Simulink data currently flowing?"""
+    fresh = _is_ingested_telemetry_fresh()
+    age_ms = None
+    if _latest_ingest_epoch is not None:
+        age_ms = int((time.time() - _latest_ingest_epoch) * 1000)
+
+    if fresh:
+        status = 'live'
+    elif _latest_telemetry_source == 'simulink' and age_ms is not None:
+        status = 'stale'
+    else:
+        status = 'offline'
+
+    return jsonify({
+        'status': status,
+        'source': _latest_telemetry_source,
+        'telemetry_age_ms': age_ms,
+        'ingest_ttl_seconds': INGEST_TTL_SECONDS,
+    })
+
+
+# ============================================================================
+# SERVER-SENT EVENTS STREAM ENDPOINT
+# ============================================================================
+
+@app.route('/api/stream', methods=['GET'])
+def sse_stream():
+    """Server-Sent Events: pushes a full data bundle to the frontend every 2s.
+    The frontend can open an EventSource to this endpoint to receive real-time
+    updates without polling.
+    """
+    PUSH_INTERVAL = 2.0  # seconds between SSE pushes
+
+    @stream_with_context
+    def event_generator():
+        while True:
+            try:
+                telemetry = _latest_telemetry or _generate_telemetry()
+                prediction = _predict_from_telemetry(telemetry)
+                shap_data = _shap_from_telemetry(telemetry)
+
+                health_score = int(prediction.get('health_score', 72))
+                if health_score >= 80:
+                    alert = {'level': 'INFO', 'message': 'SSD operating within normal parameters', 'recommendation': 'Continue normal operations'}
+                elif health_score >= 60:
+                    alert = {'level': 'WARNING', 'message': 'ECC error rate elevated - monitor closely', 'recommendation': 'Back up critical data within 30 days'}
+                elif health_score >= 40:
+                    alert = {'level': 'CRITICAL', 'message': 'Drive degradation detected - plan replacement', 'recommendation': 'Schedule drive replacement within 7 days'}
+                else:
+                    alert = {'level': 'FATAL', 'message': 'Imminent drive failure detected', 'recommendation': 'Replace drive immediately to prevent data loss'}
+
+                sim_status = 'live' if _is_ingested_telemetry_fresh() else (
+                    'stale' if _latest_telemetry_source == 'simulink' else 'offline'
+                )
+
+                # Derive OOB Status
+                ret_stage = int(telemetry.get('retirement_stage', 0))
+                oob_uart = "IDLE" if health_score >= 70 else ("ACTIVE" if health_score >= 40 else "OVERLOAD")
+                oob_ble = "30s" if health_score >= 60 else ("10s" if health_score >= 40 else "3s")
+                oob_smbus = "OK" if ret_stage < 2 else ("ALERT" if ret_stage == 2 else "CRITICAL")
+                
+                oob_status = {
+                    'uart': oob_uart,
+                    'ble': oob_ble,
+                    'smbus': oob_smbus
+                }
+
+                bundle = {
+                    'telemetry': telemetry,
+                    'prediction': prediction,
+                    'shap': shap_data,
+                    'alert': alert,
+                    'events': list(_event_log),
+                    'oob_status': oob_status,
+                    'simulation_status': sim_status,
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                }
+
+                payload = json.dumps(bundle)
+                yield f'data: {payload}\n\n'
+
+            except GeneratorExit:
+                break
+            except Exception:
+                pass
+
+            time.sleep(PUSH_INTERVAL)
+
+    return Response(
+        event_generator(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Access-Control-Allow-Origin': '*',
+        },
+    )
+
+
+# ============================================================================
 # ROOT ENDPOINT
 # ============================================================================
 
@@ -744,16 +890,18 @@ def feature_vector():
 def root():
     return jsonify({
         'name': 'NAND Guardian Backend',
-        'version': '0.2.0',
+        'version': '0.3.0',
         'xgboost_model_path': str(XGBOOST_MODEL_PATH),
         'lstm_model_path': str(LSTM_MODEL_PATH),
         'features_path': str(FEATURES_PATH),
         'endpoints': [
             '/api/telemetry - Real-time SSD telemetry data',
-            '/api/ingest-telemetry - Receive telemetry from Simulink',
+            '/api/ingest-telemetry - Receive telemetry from Simulink (POST)',
             '/api/prediction - ML model predictions',
             '/api/shap - SHAP explainability',
             '/api/alerts - Alert system',
+            '/api/simulation-status - Is Simulink data currently flowing?',
+            '/api/stream - Server-Sent Events push stream (GET)',
             '/api/health - Health check',
             '/api/feature-mapping - Model feature alignment',
             '/api/feature-vector - Current derived model input',

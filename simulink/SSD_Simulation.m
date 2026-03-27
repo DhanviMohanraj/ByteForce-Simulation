@@ -94,10 +94,10 @@ fprintf('=================================================================\n\n')
 %% =========================================================================
 %  PARAMETERS — Tune these to change simulation behaviour
 % =========================================================================
-p.sim_time          = 100;       % Simulation time (seconds)
+p.sim_time          = 200;       % Simulation time (seconds) — 200s ensures all 4 LDPC stages are traversed
 p.num_blocks        = 512;       % Total NAND blocks
 p.page_bits         = 512;       % Bits per page
-p.max_pe            = 3000;      % Max P/E cycles
+p.max_pe            = 250;       % Max P/E cycles (LOWERED for fast-aging dynamic simulation)
 p.spare_blocks      = 32;        % Spare block pool
 p.io_rate           = 10;        % I/Os per second
 
@@ -143,8 +143,11 @@ set_param(mdl, ...
     'SignalLogging',       'on', ...
     'SignalLoggingName',   'logsout');
 
-simulinkDirEsc = strrep(simulinkDir, '''', '''''');
-set_param(mdl, 'InitFcn', sprintf("if exist(''simulinkPublishStep'',''file'')~=2, addpath(''%s''); rehash; end", simulinkDirEsc));
+% Build InitFcn callback string with proper single-quote escaping.
+% The callback is evaluated DIRECTLY by Simulink, so we must emit real
+% single-quotes (not '' escape sequences) into the stored string.
+initFcnStr = ['addpath(''' simulinkDir '''); rehash;'];
+set_param(mdl, 'InitFcn', initFcnStr);
 
 % Canvas background colour (dark theme feel via annotations)
 fprintf('  [1/9] Setting up model canvas...\n');
@@ -306,7 +309,7 @@ add_block('built-in/Outport',[s '/code_rate'],   'Position',[460,260,490,280],'P
 % Wear stage LUT
 add_block('simulink/Lookup Tables/1-D Lookup Table',[s '/Stage_LUT'],...
     'Position',[150,130,310,170],...
-    'BreakpointsForDimension1','[0, 750, 1500, 2250]',...
+    'BreakpointsForDimension1', sprintf('[0, %d, %d, %d]', round(p.max_pe*0.25), round(p.max_pe*0.5), round(p.max_pe*0.75)),...
     'Table','[1, 2, 3, 4]');
 add_line(s,'pe_count/1','Stage_LUT/1');
 add_line(s,'Stage_LUT/1','wear_stage/1');
@@ -560,23 +563,40 @@ add_line(s,'J_Pct/1','journal_pct/1');
 
 % Force floating-point before threshold compare to avoid fixed-point overflow
 add_block('simulink/Signal Attributes/Data Type Conversion', [s '/J_Pct_Double'], ...
-    'Position', [430,250,510,290], ...
+    'Position', [430,195,510,235], ...
     'OutDataTypeStr', 'double', ...
     'RndMeth', 'Floor', ...
     'SaturateOnIntegerOverflow', 'on');
 add_line(s,'J_Pct/1','J_Pct_Double/1');
 
-% Flush trigger at 75%
+% Flush trigger at configured threshold (default 75%)
 add_block('simulink/Logic and Bit Operations/Compare To Constant',...
-    [s '/FlushTrig'],'Position',[430,260,510,300],...
+    [s '/FlushTrig'],'Position',[545,195,625,235],...
     'relop','>=','const',num2str(double(p.flush_pct)));
 add_line(s,'J_Pct_Double/1','FlushTrig/1');
 
-% TIER 3 — B-Tree size (grows on flush)
+% Periodic time-based flush trigger (every flush_interval seconds) using Pulse Generator
+add_block('simulink/Sources/Pulse Generator', [s '/TimedFlush'], ...
+    'Position', [430,255,510,295], ...
+    'PulseType',   'Time based', ...
+    'Period',      num2str(p.flush_interval), ...
+    'PulseWidth',  '10', ...
+    'PhaseDelay',  '0', ...
+    'Amplitude',   '1');
+
+% OR: flush if percent-full OR periodic timer fires
+add_block('simulink/Logic and Bit Operations/Logical Operator', [s '/FlushOR'], ...
+    'Position', [640,195,690,285], ...
+    'Operator', 'OR', ...
+    'Inputs',   '2');
+add_line(s,'FlushTrig/1', 'FlushOR/1');
+add_line(s,'TimedFlush/1','FlushOR/2');
+
+% TIER 3 — B-Tree size (grows on flush from either trigger)
 add_block('simulink/Discrete/Discrete-Time Integrator',[s '/BTree'],...
     'Position',[290,310,400,360],'SampleTime','0.1',...
     'UpperSaturationLimit',num2str(p.num_blocks));
-add_line(s,'FlushTrig/1','BTree/1');
+add_line(s,'FlushOR/1','BTree/1');
 add_line(s,'BTree/1','btree_sz/1');
 
 % Connect everything to BBM
@@ -657,12 +677,12 @@ fprintf('  [8.5/9] Wiring ByteForce software bridge...\n');
 
 % Top-level publisher block (version-safe): Mux 6 signals into MATLAB Fcn
 add_block('simulink/Signal Routing/Mux', [mdl '/Bridge_Publish_Mux'], ...
-    'Position', [920, 300, 960, 450], ...
-    'Inputs', '6');
+    'Position', [920, 300, 960, 700], ...
+    'Inputs', '11');  % 6 original + 5 new real signals
 
 add_block('simulink/User-Defined Functions/MATLAB Fcn', [mdl '/Publish_To_ByteForce'], ...
-    'Position', [1000, 300, 1260, 380], ...
-    'MATLABFcn', 'simulinkPublishStep(u(1),u(2),u(3),u(4),u(5),u(6))');
+    'Position', [1000, 300, 1320, 400], ...
+    'MATLABFcn', 'simulinkPublishStep(u(1),u(2),u(3),u(4),u(5),u(6),u(7),u(8),u(9),u(10),u(11))');
 
 add_block('simulink/Sinks/Display', [mdl '/Bridge_Status'], ...
     'Position', [1280, 330, 1400, 370], ...
@@ -756,9 +776,11 @@ add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Err_to_Temp'], ...
 add_block('simulink/Math Operations/Gain', [mdl '/Bridge_Retry_to_Temp'], ...
     'Position', [980, 650, 1080, 690], ...
     'Gain', '0.01');
-add_block('simulink/Sources/Constant', [mdl '/Bridge_Temp_Base'], ...
+add_block('simulink/Sources/Random Number', [mdl '/Bridge_Temp_Base'], ...
     'Position', [980, 700, 1080, 730], ...
-    'Value', '30');
+    'Mean', '30', ...
+    'Variance', '25', ...
+    'SampleTime', '0.1');
 add_block('simulink/Math Operations/Sum', [mdl '/Bridge_Temp_Sum'], ...
     'Position', [1110, 585, 1180, 735], ...
     'Inputs', '++++');
@@ -848,15 +870,63 @@ add_line(mdl, 'Bridge_Err_to_Lat/1', 'Bridge_Lat_Sum/3', 'autorouting', 'on');
 add_line(mdl, 'Bridge_Lat_Base/1', 'Bridge_Lat_Sum/4', 'autorouting', 'on');
 add_line(mdl, 'Bridge_Lat_Sum/1', 'Bridge_Lat_Clamp/1', 'autorouting', 'on');
 
-% Final bridge inputs expected by simulinkPublishStep(...)
-add_line(mdl, 'Bridge_Distortion_Clamp/1', 'Bridge_Publish_Mux/1', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Packet_Clamp/1', 'Bridge_Publish_Mux/2', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Retry_Clamp/1', 'Bridge_Publish_Mux/3', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Temp_Clamp/1', 'Bridge_Publish_Mux/4', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Wear_Clamp/1', 'Bridge_Publish_Mux/5', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Lat_Clamp/1', 'Bridge_Publish_Mux/6', 'autorouting', 'on');
-add_line(mdl, 'Bridge_Publish_Mux/1', 'Publish_To_ByteForce/1', 'autorouting', 'on');
+% ── SECTION 7.6 — THERMAL RC FILTER (replaces instant formula with physics) ──
+% H(z) = 0.005 / (1 - 0.995*z^-1)  where alpha = exp(-0.1s / 20s) ≈ 0.995
+% This gives temperature a 20-second thermal time constant (realistic lag)
+fprintf('  [8.6/9] Adding thermal RC filter...\n');
+add_block('simulink/Discrete/Discrete Filter', [mdl '/Bridge_Thermal_Filter'], ...
+    'Position', [1340, 635, 1460, 675], ...
+    'Numerator', '[0.005]', ...
+    'Denominator', '[1, -0.995]', ...
+    'SampleTime', '0.1');
+add_line(mdl, 'Bridge_Temp_Clamp/1', 'Bridge_Thermal_Filter/1', 'autorouting', 'on');
 
+% ── SECTION 7.7 — EVENT ENCODER (state transitions → firmware event codes) ──
+% Signals: BBM/is_bad, LDPC/success, LDPC/retry_flag, LDPC_Enc/wear_stage, BBM/journal_pct
+% computeEventCode() returns 0-6 (see simulink/computeEventCode.m for legend)
+fprintf('  [8.7/9] Adding firmware event encoder...\n');
+add_block('simulink/Signal Routing/Mux', [mdl '/Event_Encoder_Mux'], ...
+    'Position', [1340, 700, 1380, 870], ...
+    'Inputs', '5');
+add_block('simulink/User-Defined Functions/MATLAB Fcn', [mdl '/Event_Encoder'], ...
+    'Position', [1400, 750, 1580, 820], ...
+    'MATLABFcn', 'computeEventCode(u(1),u(2),u(3),u(4),u(5))');
+add_block('simulink/Signal Attributes/Data Type Conversion', [mdl '/Conv_Event1'], ...
+    'Position', [1280, 710, 1310, 730], 'OutDataTypeStr', 'double');
+add_block('simulink/Signal Attributes/Data Type Conversion', [mdl '/Conv_Event2'], ...
+    'Position', [1280, 740, 1310, 760], 'OutDataTypeStr', 'double');
+add_block('simulink/Signal Attributes/Data Type Conversion', [mdl '/Conv_Event3'], ...
+    'Position', [1280, 770, 1310, 790], 'OutDataTypeStr', 'double');
+
+add_line(mdl, 'BBM/1',      'Conv_Event1/1', 'autorouting', 'on');  % is_bad -> double
+add_line(mdl, 'LDPC_Dec/3', 'Conv_Event2/1', 'autorouting', 'on');  % success -> double
+add_line(mdl, 'LDPC_Dec/5', 'Conv_Event3/1', 'autorouting', 'on');  % retry_flag -> double
+
+add_line(mdl, 'Conv_Event1/1', 'Event_Encoder_Mux/1', 'autorouting', 'on');
+add_line(mdl, 'Conv_Event2/1', 'Event_Encoder_Mux/2', 'autorouting', 'on');
+add_line(mdl, 'Conv_Event3/1', 'Event_Encoder_Mux/3', 'autorouting', 'on');
+add_line(mdl, 'LDPC_Enc/2', 'Event_Encoder_Mux/4', 'autorouting', 'on');  % wear_stage (double)
+add_line(mdl, 'BBM/3',      'Event_Encoder_Mux/5', 'autorouting', 'on');  % journal_pct (double)
+
+add_line(mdl, 'Event_Encoder_Mux/1', 'Event_Encoder/1', 'autorouting', 'on');
+add_line(mdl, 'Event_Encoder/1', 'Bridge_Publish_Mux/11', 'autorouting', 'on');
+
+
+% Final bridge inputs expected by simulinkPublishStep(...)
+% u(1)-u(6): original 6 signals
+add_line(mdl, 'Bridge_Distortion_Clamp/1', 'Bridge_Publish_Mux/1',  'autorouting', 'on');  % ecc_count
+add_line(mdl, 'Bridge_Packet_Clamp/1',     'Bridge_Publish_Mux/2',  'autorouting', 'on');  % ecc_rate
+add_line(mdl, 'Bridge_Retry_Clamp/1',      'Bridge_Publish_Mux/3',  'autorouting', 'on');  % retries
+add_line(mdl, 'Bridge_Thermal_Filter/1',   'Bridge_Publish_Mux/4',  'autorouting', 'on');  % temperature (RC-filtered)
+add_line(mdl, 'Bridge_Wear_Clamp/1',       'Bridge_Publish_Mux/5',  'autorouting', 'on');  % wear_level
+add_line(mdl, 'Bridge_Lat_Clamp/1',        'Bridge_Publish_Mux/6',  'autorouting', 'on');  % latency_ms
+% u(7)-u(11): NEW real simulation signals
+add_line(mdl, 'BBM/2',         'Bridge_Publish_Mux/7',  'autorouting', 'on');  % bad_block_count (dram_cnt)
+add_line(mdl, 'BBM/3',         'Bridge_Publish_Mux/8',  'autorouting', 'on');  % journal_fill_pct
+add_line(mdl, 'Health_Mon/3',  'Bridge_Publish_Mux/9',  'autorouting', 'on');  % uber_count
+add_line(mdl, 'Retire/1',      'Bridge_Publish_Mux/10', 'autorouting', 'on');  % retirement_stage
+% u(11) = event_code, already wired via Event_Encoder → Bridge_Publish_Mux/11
+add_line(mdl, 'Bridge_Publish_Mux/1', 'Publish_To_ByteForce/1', 'autorouting', 'on');
 add_line(mdl, 'Publish_To_ByteForce/1', 'Bridge_Status/1', 'autorouting', 'on');
 
 %% =========================================================================
