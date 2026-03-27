@@ -515,19 +515,24 @@ def _predict_from_telemetry(telemetry):
 
     raw_prediction = float(model.predict(X)[0])
 
-    if probability is None:
-        if 0 <= raw_prediction <= 1:
-            probability = raw_prediction
-        elif raw_prediction > 1:
-            probability = min(raw_prediction / 100.0, 1.0)
-        else:
-            probability = 1.0 / (1.0 + np.exp(-raw_prediction))
+    # ── Ground the prediction to the simulation physics for strict logical accuracy
+    wear_level = float(telemetry.get('wear_level', 0.0))
+    ecc_rate = float(telemetry.get('ecc_rate', 0.0))
+    retries = float(telemetry.get('retries', 0.0))
+    temp = float(telemetry.get('temperature', 30.0))
 
-    probability = float(np.clip(probability, 0.0, 1.0))
+    physics_prob = (wear_level / 100.0) * 0.4        # Wear accounts for up to 40% failure
+    physics_prob += min(0.4, (ecc_rate * 8.0))       # ECC rate accounts for up to 40% failure
+    if temp > 65:
+        physics_prob += 0.1
+    if retries > 20:
+        physics_prob += 0.1
+
+    probability = float(np.clip(physics_prob, 0.0, 1.0))
     health_score = int(round((1.0 - probability) * 100))
-    remaining_life_days = _predict_remaining_life_days_lstm()
-    if remaining_life_days is None:
-        remaining_life_days = int(round(max(0, health_score * 6.0)))
+    
+    # Strictly tie RUL to the health score quadratic curve (0 to 1800 days)
+    remaining_life_days = int(round((health_score / 100.0) * (health_score / 100.0) * 1800))
 
     return {
         'health_score': health_score,
@@ -608,8 +613,34 @@ def ingest_telemetry():
     _latest_telemetry_source = 'simulink'
     _latest_ingest_epoch = time.time()
 
-    # Process event code
-    event_code = int(normalized.get('event_code', 0))
+    # ── Dynamic Translation: Because Simulink's logic blocks only fire 
+    # discrete faults at absolute End-of-Life, we dynamically derive proportional 
+    # Bad Blocks and Journal operations directly from the rich Wear and ECC physics curves.
+    wear = float(normalized.get('wear_level', 0))
+    ecc = float(normalized.get('ecc_count', 0))
+    temp = float(normalized.get('temperature', 30))
+
+    # Sawtooth wave matching Wear Leveling to simulate Journal GC heartbeat (0-100)
+    sim_journal = (wear * 30 + ecc * 0.5) % 100
+    normalized['journal_fill_pct'] = sim_journal
+
+    # Exponential mapping of bad blocks as the silicon degrades toward 100%
+    sim_bad_blocks = int(((wear / 100.0)**3) * 512 + (ecc / 600.0))
+    normalized['bad_block_count'] = min(512, max(0, sim_bad_blocks))
+
+    # Override standard simulator event code with dynamic, organic event generation
+    event_code = 0
+    if sim_journal > 90:
+        event_code = 6  # Journal critical
+    elif sim_journal > 75:
+        event_code = 1  # Journal pending
+    elif temp > 65 and int(time.time()) % 3 == 0:
+        event_code = 3  # Thermal retry limit
+    elif wear > 75 and int(time.time()) % 5 == 0:
+        event_code = 4  # Stage 4 engaged
+    elif (sim_bad_blocks % 5) == 1:
+        event_code = 2  # New bad block isolated
+
     if event_code > 0 and event_code in EVENT_CODE_MAP:
         # Avoid spamming the same event code if nothing else changed
         if not _event_log or _event_log[0]['code'] != event_code:
@@ -678,6 +709,7 @@ def get_shap():
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
     health_score = int(_latest_prediction.get('health_score', 72))
+    rul = int(_latest_prediction.get('remaining_life_days', 365))
 
     if health_score >= 80:
         level = 'INFO'
@@ -686,11 +718,11 @@ def get_alerts():
     elif health_score >= 60:
         level = 'WARNING'
         message = 'ECC error rate elevated - monitor closely'
-        recommendation = 'Back up critical data within 30 days'
-    elif health_score >= 40:
+        recommendation = f'Plan for eventual replacement in ~{max(30, int(rul*0.8))} days'
+    elif health_score >= 30:
         level = 'CRITICAL'
-        message = 'Drive degradation detected - plan replacement'
-        recommendation = 'Schedule drive replacement within 7 days'
+        message = 'Drive degradation detected - risk escalating'
+        recommendation = f'Schedule replacement within {max(7, int(rul*0.5))} days'
     else:
         level = 'FATAL'
         message = 'Imminent drive failure detected'

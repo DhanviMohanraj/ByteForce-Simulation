@@ -20,8 +20,8 @@ $featuresPath = Join-Path $projectRoot 'model/features.json'
 $simulinkDir  = Join-Path $projectRoot 'simulink'
 
 Write-Host '=================================================================' -ForegroundColor Cyan
-Write-Host '  ByteForce — Full System Startup' -ForegroundColor Cyan
-Write-Host '  Simulation → ML Backend → Dashboard' -ForegroundColor Cyan
+Write-Host '  ByteForce - Full System Startup' -ForegroundColor Cyan
+Write-Host '  Simulation -> ML Backend -> Dashboard' -ForegroundColor Cyan
 Write-Host '=================================================================' -ForegroundColor Cyan
 Write-Host ''
 
@@ -96,7 +96,7 @@ Write-Host "    run('runSimulationAndStream.m')"
 Write-Host "    % Script builds model, runs sim, streams all telemetry"
 Write-Host ''
 Write-Host '  When MATLAB is running, the dashboard banner will show:' -ForegroundColor Cyan
-Write-Host '    [MATLAB] → [Flask API] → [XGBoost/LSTM] → [Dashboard]' -ForegroundColor Cyan
+Write-Host '    [MATLAB] -> [Flask API] -> [XGBoost/LSTM] -> [Dashboard]' -ForegroundColor Cyan
 Write-Host '  All nodes green = full pipeline live.' -ForegroundColor Cyan
 Write-Host ''
 

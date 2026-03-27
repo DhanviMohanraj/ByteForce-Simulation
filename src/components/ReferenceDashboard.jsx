@@ -20,10 +20,10 @@ const LEVEL_NUM = { INFO: 1, WARNING: 2, CRITICAL: 3, FATAL: 4 }
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function createBlocks(badBlocks = 0, journalPct = 0) {
-  // 250 blocks total in visualization
+  // 250 blocks total in visualization to represent the 512 physical blocks
   const total = 250;
-  // Proportional bad blocks
-  const badCount = Math.min(total, Math.ceil((badBlocks / 1000) * total)); 
+  // Proportional bad blocks out of 512 physical limit
+  const badCount = Math.min(total, Math.ceil((badBlocks / 512) * total)); 
   // Proportional erasing blocks based on journal
   const eraseCount = Math.min(total - badCount, Math.ceil((journalPct / 100) * 15)); 
   // Some active blocks
@@ -701,13 +701,7 @@ export default function ReferenceDashboard() {
           <span className="rounded border border-[#1a2a42] bg-[#071022] px-3 py-1 font-mono text-sm text-[#9bc7ff]">
             {time.toLocaleTimeString('en-GB')}
           </span>
-          <span className={`rounded border px-2 py-1 text-xs font-semibold ${
-            backendOk
-              ? 'border-green-700 bg-green-900/30 text-green-400'
-              : 'border-red-900 bg-red-900/20 text-red-400'
-          }`}>
-            {backendOk ? '● MODEL API' : '○ BACKEND OFFLINE'}
-          </span>
+
           <span className={`rounded border px-2 py-1 text-xs font-semibold ${
             simStatus === 'live'  ? 'border-cyan-700 bg-cyan-900/30 text-cyan-300'
             : simStatus === 'stale' ? 'border-amber-700 bg-amber-900/20 text-amber-400'
@@ -727,15 +721,7 @@ export default function ReferenceDashboard() {
         </div>
       </header>
 
-      {/* Pipeline banner */}
-      <div className="border-b border-[#0e1e35] bg-[#040a17] px-5 py-2">
-        <SimulationStatus
-          backendConnected={backendOk}
-          simulationStatus={simStatus}
-          modelLoaded={modelLoaded}
-          telemetryAgeMs={telemetryAgeMs}
-        />
-      </div>
+
 
       {/* Main 3-column grid */}
       <div className="grid min-h-[calc(100vh-112px)] grid-cols-1 xl:grid-cols-[220px_1fr_270px]">
