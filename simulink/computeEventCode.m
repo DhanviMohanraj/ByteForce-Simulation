@@ -1,55 +1,83 @@
 function code = computeEventCode(is_bad, success, retry_flag, wear_stage, journal_pct)
-% computeEventCode — Firmware event encoder for ByteForce bridge.
-% Called every simulation timestep by the Event_Encoder Simulink block.
+% computeEventCode — QMC-optimised firmware event encoder (ByteForce bridge).
 %
-% Maps current simulation state to a single numeric event code (0-6).
-% Priority: higher codes override lower ones.
+% This function implements the SAME priority logic as the original if-chain,
+% but executes via a 64-entry pre-computed lookup table generated offline by
+% qmc_minimize.m using the Quine-McCluskey algorithm + Petrick's method.
 %
-% Inputs (from top-level Simulink signals):
-%   is_bad      - BBM/1: 1 if current block is bad, 0 otherwise
-%   success     - LDPC_Dec/3: 1 if decode succeeded, 0 = UBER event
-%   retry_flag  - LDPC_Dec/5: 1 if read retry is active
-%   wear_stage  - LDPC_Enc/2: wear stage 1-4
-%   journal_pct - BBM/3: journal fill percentage 0-100
+% On real NVMe silicon the equivalent ROM lookup executes in a single clock
+% cycle. Here it replaces 6 nested conditional branches with one array index.
 %
-% Output event codes:
-%   0 = Nominal — no significant event
-%   1 = Journal fill >75% (approaching flush threshold)
-%   2 = New bad block detected by DRAM hash table
-%   3 = Read retry activated — ECC headroom low
-%   4 = LDPC Stage 4 engaged — maximum wear correction mode
-%   5 = Uncorrectable ECC error (UBER event)
-%   6 = Journal capacity critical — flush triggered (>90%)
+% INPUT ENCODING  (6 binary variables → 6-bit index → 64-entry LUT)
+%   bit5 (MSB) : is_bad       — BBM flagged current block as bad
+%   bit4       : uber_event   — NOT success (uncorrectable ECC error)
+%   bit3       : retry_flag   — read retry active (LDPC headroom < 20%)
+%   bit2       : stage4       — wear_stage >= 4 (max correction mode)
+%   bit1       : journal_hi   — journal_pct >= 90 (critical flush)
+%   bit0 (LSB) : journal_lo   — journal_pct >= 75 (pending flush)
+%
+% Output event codes  (identical to original):
+%   0 = Nominal
+%   1 = Journal fill > 75%   (approaching flush threshold)
+%   2 = New bad block         (DRAM hash table hit)
+%   3 = Read retry active     (ECC headroom exhausted)
+%   4 = LDPC Stage 4          (maximum wear correction mode)
+%   5 = UBER event            (uncorrectable — highest non-fatal)
+%   6 = Journal critical >90% (overrides all except UBER)
 
-% Default: nominal
-code = 0;
-
-% Priority escalation (each if overrides the previous)
-if journal_pct >= 75
-    code = 1;
-end
-
-if is_bad > 0.5
-    code = 2;
-end
-
-if retry_flag > 0.5
-    code = 3;
-end
-
-if wear_stage >= 4
-    code = 4;
-end
-
-if success < 0.5
-    code = 5;   % UBER — highest non-fatal priority
-end
-
-if journal_pct >= 90
-    code = 6;   % Journal critical — overrides all except UBER
-    if success < 0.5
-        code = 5;  % UBER still wins
+% ── Cache the 64-entry LUT so it is built once per simulation run ────────────
+persistent EVENT_LUT
+if isempty(EVENT_LUT)
+    lut_path = fullfile(fileparts(mfilename('fullpath')), 'event_code_lut.mat');
+    if exist(lut_path, 'file')
+        % Fast path: load pre-built LUT from qmc_minimize output
+        S = load(lut_path, 'LUT');
+        EVENT_LUT = S.LUT;
+    else
+        % Fallback: build LUT inline (same logic, no file I/O dependency)
+        EVENT_LUT = build_lut_inline();
     end
 end
 
+% ── Encode the 5 continuous inputs into the 6-bit binary index ────────────
+b5 = double(is_bad    > 0.5);          % bit 5
+b4 = double(success   < 0.5);          % bit 4 (UBER = NOT success)
+b3 = double(retry_flag > 0.5);         % bit 3
+b2 = double(wear_stage >= 4);          % bit 2
+b1 = double(journal_pct >= 90);        % bit 1  (journal critical)
+b0 = double(journal_pct >= 75);        % bit 0  (journal pending)
+
+% Single-instruction O(1) table lookup  ──────────────────────────────────────
+idx  = b5*32 + b4*16 + b3*8 + b2*4 + b1*2 + b0;   % 0..63
+code = double(EVENT_LUT(idx + 1));                   % +1: MATLAB 1-based index
+
+end
+
+
+%% ── INLINE FALLBACK LUT BUILDER ─────────────────────────────────────────────
+%  Identical priority logic to the original if-chain; executes only once
+%  (or if event_code_lut.mat has not been generated yet by qmc_minimize.m).
+function LUT = build_lut_inline()
+LUT = zeros(64, 1, 'uint8');
+for idx = 0 : 63
+    % Extract each bit using bitand — no Communications Toolbox required
+    is_b  = bitand(idx, 32) > 0;   % bit 5 (MSB)
+    uber  = bitand(idx, 16) > 0;   % bit 4
+    retry = bitand(idx,  8) > 0;   % bit 3
+    st4   = bitand(idx,  4) > 0;   % bit 2
+    j_hi  = bitand(idx,  2) > 0;   % bit 1
+    j_lo  = bitand(idx,  1) > 0;   % bit 0 (LSB)
+
+    c = 0;
+    if j_lo,  c = 1; end
+    if is_b,  c = 2; end
+    if retry, c = 3; end
+    if st4,   c = 4; end
+    if uber,  c = 5; end
+    if j_hi
+        c = 6;
+        if uber, c = 5; end
+    end
+    LUT(idx + 1) = uint8(c);
+end
 end
