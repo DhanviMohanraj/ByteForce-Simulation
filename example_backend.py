@@ -515,24 +515,27 @@ def _predict_from_telemetry(telemetry):
 
     raw_prediction = float(model.predict(X)[0])
 
-    # ── Ground the prediction to the simulation physics for strict logical accuracy
+    # ── Ground prediction strictly to physics so 100% wear = 100% failure
     wear_level = float(telemetry.get('wear_level', 0.0))
-    ecc_rate = float(telemetry.get('ecc_rate', 0.0))
-    retries = float(telemetry.get('retries', 0.0))
-    temp = float(telemetry.get('temperature', 30.0))
+    ecc_rate   = float(telemetry.get('ecc_rate', 0.0))
+    retries    = float(telemetry.get('retries', 0.0))
+    temp       = float(telemetry.get('temperature', 30.0))
 
-    physics_prob = (wear_level / 100.0) * 0.4        # Wear accounts for up to 40% failure
-    physics_prob += min(0.4, (ecc_rate * 8.0))       # ECC rate accounts for up to 40% failure
-    if temp > 65:
-        physics_prob += 0.1
-    if retries > 20:
-        physics_prob += 0.1
+    # Wear is the PRIMARY driver — cubic curve so early wear stays low,
+    # but once past 70% it rockets toward 1.0 (0% wear → 0%, 100% wear → 100%)
+    wear_norm   = wear_level / 100.0
+    wear_prob   = wear_norm ** 2                         # quadratic: 50% wear = 25% prob
 
-    probability = float(np.clip(physics_prob, 0.0, 1.0))
+    # Secondary signals add pressure on top — capped so wear stays dominant
+    ecc_boost   = min(0.15, ecc_rate * 10.0)            # ECC adds up to 15%
+    temp_boost  = 0.05 if temp > 65 else 0.0            # Thermal stress adds 5%
+    retry_boost = 0.05 if retries > 20 else 0.0         # Retry pressure adds 5%
+
+    probability = float(np.clip(wear_prob + ecc_boost + temp_boost + retry_boost, 0.0, 1.0))
     health_score = int(round((1.0 - probability) * 100))
-    
-    # Strictly tie RUL to the health score quadratic curve (0 to 1800 days)
-    remaining_life_days = int(round((health_score / 100.0) * (health_score / 100.0) * 1800))
+
+    # RUL decays quadratically: 0% wear = 1800 days, 100% wear = 0 days
+    remaining_life_days = int(round((1.0 - wear_norm) ** 2 * 1800))
 
     return {
         'health_score': health_score,
@@ -619,6 +622,28 @@ def ingest_telemetry():
     wear = float(normalized.get('wear_level', 0))
     ecc = float(normalized.get('ecc_count', 0))
     temp = float(normalized.get('temperature', 30))
+    wear_norm = wear / 100.0  # 0.0 → 1.0
+
+    # ── Amplify all secondary signals to physically realistic wear-scaled values ──
+    # Simulink's RBER uses /1000 divisor designed for 3000-cycle drives.
+    # With max_pe=65 that crushes all signals. We correct them here organically.
+    #
+    # ECC rate: 0.0001 (fresh) → 0.015 (end-of-life)  quadratic
+    sim_ecc_rate = 0.0001 + (wear_norm ** 2) * 0.0149
+    normalized['ecc_rate'] = round(sim_ecc_rate, 6)
+    #
+    # Retries: 0 (fresh) → 200 (end-of-life)  cubic — stays low until very worn
+    sim_retries = int((wear_norm ** 3) * 200)
+    normalized['retries'] = sim_retries
+    #
+    # Latency: 0.35ms (fresh) → 8ms (end-of-life)  quadratic
+    sim_latency = 0.35 + (wear_norm ** 2) * 7.65
+    normalized['latency'] = round(sim_latency, 3)
+    #
+    # Temperature: base ~30°C rises to ~78°C at full wear due to error correction load
+    sim_temp = temp + (wear_norm ** 2) * 48.0
+    normalized['temperature'] = round(min(sim_temp, 95.0), 1)
+    temp = normalized['temperature']  # update local reference for event logic below
 
     # Sawtooth wave matching Wear Leveling to simulate Journal GC heartbeat (0-100)
     sim_journal = (wear * 30 + ecc * 0.5) % 100
@@ -709,24 +734,25 @@ def get_shap():
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts():
     health_score = int(_latest_prediction.get('health_score', 72))
-    rul = int(_latest_prediction.get('remaining_life_days', 365))
+    probability  = float(_latest_prediction.get('failure_probability', 0.0))
+    rul          = int(_latest_prediction.get('remaining_life_days', 365))
 
-    if health_score >= 80:
+    if probability >= 0.90:
+        level = 'FATAL'
+        message = 'Imminent drive failure — NAND silicon exhausted'
+        recommendation = 'Replace drive IMMEDIATELY to prevent data loss'
+    elif probability >= 0.60:
+        level = 'CRITICAL'
+        message = 'Drive degradation critical — wear threshold breached'
+        recommendation = f'Schedule replacement within {max(1, rul)} days'
+    elif probability >= 0.25:
+        level = 'WARNING'
+        message = 'ECC error rate elevated — monitor closely'
+        recommendation = f'Plan for replacement in ~{max(30, rul)} days'
+    else:
         level = 'INFO'
         message = 'SSD operating within normal parameters'
         recommendation = 'Continue normal operations'
-    elif health_score >= 60:
-        level = 'WARNING'
-        message = 'ECC error rate elevated - monitor closely'
-        recommendation = f'Plan for eventual replacement in ~{max(30, int(rul*0.8))} days'
-    elif health_score >= 30:
-        level = 'CRITICAL'
-        message = 'Drive degradation detected - risk escalating'
-        recommendation = f'Schedule replacement within {max(7, int(rul*0.5))} days'
-    else:
-        level = 'FATAL'
-        message = 'Imminent drive failure detected'
-        recommendation = 'Replace drive immediately to prevent data loss'
 
     alert = {
         'level': level,

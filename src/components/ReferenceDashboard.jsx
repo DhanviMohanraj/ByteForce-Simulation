@@ -47,9 +47,11 @@ function createBlocks(badBlocks = 0, journalPct = 0) {
 }
 
 function createLinePoints(data) {
-  const max = Math.max(...data, 1)
-  const min = Math.min(...data, 0)
-  const span = Math.max(max - min, 0.001)
+  // Auto-scale to the actual data range so tiny ECC values (e.g. 0.01) are visible
+  const nonZero = data.filter(v => v > 0)
+  const max = nonZero.length > 0 ? Math.max(...nonZero) : 1
+  const min = nonZero.length > 0 ? Math.min(...nonZero) : 0
+  const span = Math.max(max - min, max * 0.01, 0.000001) // at least 1% of max
   return data
     .map((v, i) => {
       const x = (i / Math.max(data.length - 1, 1)) * 100
@@ -70,7 +72,9 @@ function wearStageLabel(wear) {
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function MiniLine({ data, color }) {
-  const points = useMemo(() => createLinePoints(data), [data])
+  // Track last value + length so useMemo always recomputes when new data arrives
+  const lastVal = data[data.length - 1]
+  const points = useMemo(() => createLinePoints(data), [data.length, lastVal]) // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <svg viewBox="0 0 100 100" className="h-16 w-full">
       <polyline fill="none" stroke={color} strokeWidth="2.5" points={points} />
@@ -619,7 +623,8 @@ export default function ReferenceDashboard() {
     if (pred) setPrediction(pred)
     if (bundle.shap) setShap(bundle.shap)
     if (alt) setAlert(alt)
-    if (bundle.simulation_status) setSimStatus(bundle.simulation_status)
+    const incomingStatus = bundle.simulation_status || 'offline'
+    if (bundle.simulation_status) setSimStatus(incomingStatus)
     if (bundle.oob_status) setOobStatus(bundle.oob_status)
 
     // Load real firmware events stream
@@ -627,7 +632,10 @@ export default function ReferenceDashboard() {
       setLogs(bundle.events)
     }
 
-    setEvents((prev) => prev + 1)
+    // Only count events when Simulink is actually live — freeze counter when offline
+    if (incomingStatus === 'live') {
+      setEvents((prev) => prev + 1)
+    }
 
     // Compute NAND blocks using real signals instead of completely random
     if (tel) {
